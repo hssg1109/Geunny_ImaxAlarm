@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright, BrowserContext, Page, Route
+from playwright.async_api import async_playwright, BrowserContext, Page
 
 load_dotenv()
 
@@ -204,55 +204,72 @@ def parse_schedule(body: dict, date: str, debug: bool = False) -> list:
 
 
 _debug_logged: set = set()  # 날짜별 최초 1회만 debug 출력
+_page_ready: bool = False   # CGV 페이지 초기 로드 여부
+
+
+async def ensure_cgv_loaded(page: Page) -> None:
+    """CGV 메인 페이지를 한 번 로드해 JS fetch interceptor를 활성화합니다."""
+    global _page_ready
+    if not _page_ready or "cgv.co.kr" not in page.url or "login" in page.url:
+        print("[페이지] CGV 메인 로드 중...", flush=True)
+        await page.goto("https://cgv.co.kr/", wait_until="domcontentloaded", timeout=20000)
+        await page.wait_for_timeout(2000)
+        _page_ready = True
 
 
 async def check_date(page: Page, date: str) -> list:
-    """특정 날짜의 상영 스케줄 API 응답을 인터셉트합니다."""
-    captured_responses = []
-    received = asyncio.Event()
+    """CGV 페이지 JS 컨텍스트에서 직접 fetch로 스케줄 API 호출.
 
-    async def handle_route(route: Route):
-        response = await route.fetch()
-        try:
-            body = await response.json()
-            status_code = body.get("statusCode", "")
-            if str(status_code) == "200":
-                first_time = date not in _debug_logged
-                if first_time:
-                    _debug_logged.add(date)
-                sessions = parse_schedule(body, date, debug=first_time)
-                captured_responses.extend(sessions)
-            else:
-                print(f"[{date}] API 상태: {status_code} - {body.get('statusMessage','')}")
-        except Exception as e:
-            text = await response.text()
-            print(f"[{date}] 응답 파싱 오류: {e} | {text[:100]}")
-        finally:
-            await route.fulfill(response=response)
-            received.set()
+    /ticket URL이 404를 반환하는 문제를 우회합니다.
+    accessToken 쿠키를 Bearer 토큰으로 자동 사용하며,
+    페이지 내 CGV fetch 인터셉터가 x-signature를 자동으로 추가합니다.
+    """
+    await ensure_cgv_loaded(page)
 
-    url_pattern = f"**/cnm/atkt/searchSchByMov*scnYmd={date}*"
-    await page.route(url_pattern, handle_route)
-
-    ticket_url = (
-        f"https://cgv.co.kr/ticket"
-        f"?coCd={CO_CD}&siteNo={SITE_NO}&movNo={MOV_NO}"
-        f"&scnYmd={date}&rtctlScopCd={RTCTL_SCOP_CD}"
+    api_url = (
+        f"https://api.cgv.co.kr/cnm/atkt/searchSchByMov"
+        f"?coCd={CO_CD}&siteNo={SITE_NO}&scnYmd={date}"
+        f"&movNo={MOV_NO}&rtctlScopCd={RTCTL_SCOP_CD}"
     )
 
-    try:
-        await page.goto(ticket_url, wait_until="domcontentloaded", timeout=25000)
-        # API 응답 대기 (최대 10초)
-        try:
-            await asyncio.wait_for(received.wait(), timeout=10.0)
-        except asyncio.TimeoutError:
-            print(f"[{date}] API 응답 없음 (타임아웃) — 아직 스케줄 없을 수 있음", flush=True)
-    except Exception as e:
-        print(f"[{date}] 페이지 오류: {type(e).__name__}: {e}")
-    finally:
-        await page.unroute(url_pattern)
+    # page.evaluate(): CGV 페이지 컨텍스트에서 fetch 실행
+    # → 페이지 JS가 Authorization / x-signature 헤더를 자동 부착
+    result = await page.evaluate(f"""
+        async () => {{
+            try {{
+                const r = await fetch("{api_url}", {{ credentials: "include" }});
+                const body = await r.json();
+                return {{ status: r.status, body }};
+            }} catch(e) {{
+                return {{ error: String(e) }};
+            }}
+        }}
+    """)
 
-    return captured_responses
+    if result.get("error"):
+        print(f"[{date}] fetch 오류: {result['error']}", flush=True)
+        return []
+
+    http_status = result.get("status", 0)
+    body = result.get("body", {})
+    api_status = str(body.get("statusCode", ""))
+
+    if http_status == 401 or api_status == "401":
+        print(f"[{date}] 401 — 세션 만료. 재로그인 필요", flush=True)
+        global _page_ready
+        _page_ready = False   # 다음 라운드에 재로드 유도
+        return []
+
+    if api_status == "200":
+        first_time = date not in _debug_logged
+        if first_time:
+            _debug_logged.add(date)
+        return parse_schedule(body, date, debug=first_time)
+
+    # 스케줄 없음 (아직 오픈 전) 또는 다른 상태
+    msg = body.get("statusMessage", "")
+    print(f"[{date}] 스케줄 없음 (API {api_status or http_status} {msg})", flush=True)
+    return []
 
 
 async def process_results(sessions: list, date: str) -> int:
