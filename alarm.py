@@ -1,8 +1,8 @@
 """
-CGV 용산IMAX 좌석 오픈 알리미
+CGV 용산IMAX 좌석 오픈 알리미 (직접 HTTP 호출 버전)
 
-첫 실행 시 브라우저 창이 열리면 CGV에 직접 로그인하세요.
-로그인 후 쿠키가 저장되어 이후 실행은 자동으로 진행됩니다.
+Playwright 없이 httpx로 CGV API를 직접 폴링합니다.
+브라우저 DevTools에서 복사한 Bearer 토큰을 .env에 넣으면 바로 동작합니다.
 """
 
 import asyncio
@@ -12,25 +12,122 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright, BrowserContext, Page
 
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
 
-MOV_NO = os.getenv("MOV_NO", "30001210")
-SITE_NO = os.getenv("SITE_NO", "0013")
-CO_CD = os.getenv("CO_CD", "A420")
-RTCTL_SCOP_CD = os.getenv("RTCTL_SCOP_CD", "08")
-WATCH_DATES = [d.strip() for d in os.getenv("WATCH_DATES", "").split(",") if d.strip()]
+MOV_NO         = os.getenv("MOV_NO", "30001210")
+SITE_NO        = os.getenv("SITE_NO", "0013")
+CO_CD          = os.getenv("CO_CD", "A420")
+RTCTL_SCOP_CD  = os.getenv("RTCTL_SCOP_CD", "08")
+CUST_NO        = os.getenv("CUST_NO", "")
+WATCH_DATES    = [d.strip() for d in os.getenv("WATCH_DATES", "").split(",") if d.strip()]
 
-COOKIE_FILE = Path(__file__).parent / "cgv_session.json"
-SCHEDULE_API_PATH = "/cnm/atkt/searchSchByMov"
+# 브라우저 DevTools → Network 탭 → searchSchByMov 요청 → Headers → authorization 값
+BEARER_TOKEN   = os.getenv("BEARER_TOKEN", "")
+
+TOKEN_FILE = Path(__file__).parent / "token.json"
+
+CGV_API_BASE = "https://api.cgv.co.kr"
+SCHEDULE_PATH = "/cnm/atkt/searchSchByMov"
 
 notified_sessions: set = set()
+
+
+# ── HTTP 클라이언트 ─────────────────────────────────────────────────────────
+
+def make_headers(token: str) -> dict:
+    return {
+        "accept": "application/json",
+        "accept-language": "ko-KR",
+        "authorization": f"Bearer {token}",
+        "origin": "https://cgv.co.kr",
+        "referer": "https://cgv.co.kr/",
+        "user-agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0"
+        ),
+    }
+
+
+async def fetch_schedule(client: httpx.AsyncClient, token: str, date: str) -> httpx.Response:
+    params = {
+        "coCd": CO_CD,
+        "siteNo": SITE_NO,
+        "scnYmd": date,
+        "movNo": MOV_NO,
+        "rtctlScopCd": RTCTL_SCOP_CD,
+    }
+    if CUST_NO:
+        params["custNo"] = CUST_NO
+
+    return await client.get(
+        CGV_API_BASE + SCHEDULE_PATH,
+        params=params,
+        headers=make_headers(token),
+        timeout=15.0,
+    )
+
+
+# ── 토큰 저장/로드 ─────────────────────────────────────────────────────────
+
+def save_token(token: str) -> None:
+    TOKEN_FILE.write_text(json.dumps({"bearer": token}))
+
+
+def load_token() -> str:
+    """저장된 토큰 로드. 없으면 .env 값 사용."""
+    if TOKEN_FILE.exists():
+        try:
+            return json.loads(TOKEN_FILE.read_text()).get("bearer", "")
+        except Exception:
+            pass
+    return BEARER_TOKEN
+
+
+# ── 토큰 갱신 ─────────────────────────────────────────────────────────────
+
+async def try_refresh_token(client: httpx.AsyncClient, current_token: str) -> str:
+    """
+    refresh_token 쿠키로 새 Bearer 토큰 요청 시도.
+    CGV 갱신 엔드포인트가 확인되면 이 함수를 업데이트하세요.
+    """
+    # 알려진 후보 엔드포인트들 순서대로 시도
+    candidates = [
+        ("POST", "/com/bznsCom/custKeep/reissueToken"),
+        ("POST", "/com/auth/reissue"),
+        ("GET",  "/com/bznsCom/custKeep/reissueToken"),
+    ]
+    for method, path in candidates:
+        try:
+            resp = await client.request(
+                method,
+                CGV_API_BASE + path,
+                headers=make_headers(current_token),
+                timeout=10.0,
+            )
+            if resp.status_code == 200:
+                body = resp.json()
+                new_token = (
+                    body.get("data", {}).get("accessToken")
+                    or body.get("data", {}).get("token")
+                    or body.get("accessToken")
+                )
+                if new_token:
+                    print(f"[토큰] 갱신 성공 (엔드포인트: {path})", flush=True)
+                    save_token(new_token)
+                    return new_token
+        except Exception:
+            pass
+
+    print("[토큰] 자동 갱신 실패 — .env의 BEARER_TOKEN을 새로 복사해주세요.", flush=True)
+    return current_token
 
 
 # ── Telegram ────────────────────────────────────────────────────────────────
@@ -42,354 +139,173 @@ async def send_telegram(message: str) -> None:
     try:
         import telegram
         bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
-        # 10초 타임아웃: 네트워크 문제 시 무한 대기 방지
         await asyncio.wait_for(
             bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="HTML"),
-            timeout=10.0
+            timeout=10.0,
         )
         print("[텔레그램] 전송 완료", flush=True)
     except asyncio.TimeoutError:
-        print("[텔레그램] 전송 타임아웃 (10초) — 계속 진행", flush=True)
+        print("[텔레그램] 전송 타임아웃 — 계속 진행", flush=True)
     except Exception as e:
         print(f"[텔레그램] 전송 실패: {e}", flush=True)
 
 
-# ── 쿠키 저장/로드 ─────────────────────────────────────────────────────────
+# ── 파싱 ────────────────────────────────────────────────────────────────────
 
-async def save_cookies(context: BrowserContext) -> None:
-    cookies = await context.cookies()
-    with open(COOKIE_FILE, "w", encoding="utf-8") as f:
-        json.dump(cookies, f, ensure_ascii=False, indent=2)
-    print(f"[쿠키] 저장 완료: {COOKIE_FILE}")
+def parse_schedule(data: list, date: str, debug: bool = False) -> list:
+    """
+    API 응답 data 배열에서 IMAX 잔여석 세션 추출.
 
+    실제 필드명 (응답에서 확인):
+      frSeatCnt  → 잔여석
+      stcnt      → 총좌석
+      scnsrtTm   → 시작시간 (HHMM)
+      scnsNm     → 상영관명
+      scnYmd     → 날짜
+    """
+    if debug and data:
+        print(f"[DEBUG] 첫 번째 세션 키: {list(data[0].keys())}", flush=True)
 
-async def load_cookies(context: BrowserContext) -> bool:
-    if not COOKIE_FILE.exists():
-        return False
-    try:
-        with open(COOKIE_FILE, "r", encoding="utf-8") as f:
-            cookies = json.load(f)
-        await context.add_cookies(cookies)
-        print(f"[쿠키] 로드 완료 ({len(cookies)}개)")
-        return True
-    except Exception as e:
-        print(f"[쿠키] 로드 실패: {e}")
-        return False
-
-
-# ── 로그인 ─────────────────────────────────────────────────────────────────
-
-async def auto_login(context: BrowserContext) -> bool:
-    """env의 CGV_ID/CGV_PW로 자동 로그인합니다."""
-    page = await context.new_page()
-    try:
-        print(f"[로그인] 자동 로그인 시도 (ID: {CGV_ID})")
-        await page.goto("https://cgv.co.kr/login", wait_until="domcontentloaded", timeout=20000)
-        await page.wait_for_timeout(1000)
-
-        # ID 입력
-        await page.fill("input[name='username']", CGV_ID)
-        await page.wait_for_timeout(300)
-
-        # PW 입력
-        await page.fill("input[name='password']", CGV_PW)
-        await page.wait_for_timeout(300)
-
-        # 로그인 버튼 클릭: 같은 클래스의 버튼이 2개(뒤로가기/로그인)이므로 마지막 버튼 선택
-        await page.locator("button[class*='loginButton']").last().click()
-
-        # 로그인 완료 대기 (최대 10초)
-        await page.wait_for_url(lambda url: "login" not in url, timeout=10000)
-        print("[로그인] 자동 로그인 성공!")
-        await save_cookies(context)
-        return True
-
-    except Exception as e:
-        print(f"[로그인] 자동 로그인 실패: {e}")
-        return False
-    finally:
-        await page.close()
-
-
-async def manual_login(context: BrowserContext) -> None:
-    """브라우저 창을 열고 사용자가 직접 로그인할 때까지 대기합니다 (fallback)."""
-    page = await context.new_page()
-    print("\n" + "="*60)
-    print("브라우저에서 CGV에 직접 로그인해주세요.")
-    print("로그인 완료 후 메인 페이지로 이동하면 자동 진행됩니다.")
-    print("="*60)
-    await page.goto("https://cgv.co.kr/login", wait_until="domcontentloaded")
-
-    for _ in range(180):  # 최대 3분 대기
-        await asyncio.sleep(1)
-        if "login" not in page.url:
-            print("[로그인] 수동 로그인 성공 감지!")
-            break
-    else:
-        print("[로그인] 시간 초과. 그래도 계속 진행합니다.")
-
-    await save_cookies(context)
-    await page.close()
-
-
-async def check_session_valid(page: Page) -> bool:
-    """현재 세션이 유효한지 확인 (로그인 상태인지)"""
-    try:
-        await page.goto("https://cgv.co.kr/mypage", wait_until="domcontentloaded", timeout=15000)
-        is_valid = "login" not in page.url
-        print(f"[세션] {'유효한 로그인 세션 확인' if is_valid else '로그인 필요'}")
-        return is_valid
-    except Exception as e:
-        print(f"[세션] 확인 오류: {e}")
-        return False
-
-
-# ── 스케줄 확인 ────────────────────────────────────────────────────────────
-
-def parse_schedule(body: dict, date: str, debug: bool = False) -> list:
-    """API 응답에서 예매 가능 세션 추출 (필드명 fallback 처리)"""
     available = []
-    try:
-        data = body.get("data") or {}
+    for s in data:
+        hall = s.get("scnsNm") or s.get("expoScnsNm") or ""
+        # IMAX 상영관 필터 (아이맥스관, IMAX 등)
+        if "imax" not in hall.lower() and "아이맥스" not in hall:
+            continue
 
-        if debug:
-            print(f"[DEBUG] 응답 최상위 키: {list(body.keys())}")
-            if isinstance(data, dict):
-                print(f"[DEBUG] data 키: {list(data.keys())}")
-            elif isinstance(data, list):
-                print(f"[DEBUG] data = list({len(data)}개), 첫 항목 키: {list(data[0].keys()) if data else '비어있음'}")
+        remain = int(s.get("frSeatCnt") or s.get("cpSeatCnt") or 0)
+        total  = int(s.get("stcnt") or 0)
 
-        # CGV API 응답 구조: data.schList 또는 data 자체가 list
-        sessions = (
-            data.get("schList")
-            or data.get("scheduleList")
-            or data.get("list")
-            or (data if isinstance(data, list) else [])
-        )
+        if remain <= 0:
+            continue
 
-        if debug and sessions:
-            print(f"[DEBUG] 세션 {len(sessions)}개, 첫 번째 필드: {list(sessions[0].keys())}")
+        time_raw = s.get("scnsrtTm") or s.get("rlMovStartTm") or "?"
+        # "0800" → "08:00"
+        time_fmt = f"{time_raw[:2]}:{time_raw[2:]}" if len(time_raw) == 4 else time_raw
 
-        for s in sessions:
-            # 잔여석 필드명 후보
-            remain = int(
-                s.get("rmndSeatCnt")
-                or s.get("remainSeatCnt")
-                or s.get("leftSeatCnt")
-                or 0
-            )
-            total = int(
-                s.get("totSeatCnt")
-                or s.get("totalSeatCnt")
-                or s.get("seatCnt")
-                or 0
-            )
-            # 예매 불가 상태 코드 체크
-            status = s.get("schSttsCd") or s.get("status") or ""
-            if status in ("SOLDOUT", "CLOSED", "N"):
-                continue
-
-            if remain > 0 or (not remain and status in ("", "OPEN", "Y")):
-                available.append({
-                    "date": date,
-                    "time": s.get("scrnStartDttm") or s.get("startTime") or s.get("schDttm") or "?",
-                    "remain": remain,
-                    "total": total,
-                    "hall": s.get("scrnNm") or s.get("hallName") or s.get("theatreName") or "IMAX",
-                    "session_id": s.get("schNo") or s.get("sessionId") or s.get("schId") or str(s),
-                })
-    except Exception as e:
-        print(f"[파싱] 오류: {e}")
+        available.append({
+            "date": date,
+            "time": time_fmt,
+            "remain": remain,
+            "total": total,
+            "hall": hall,
+            "session_id": s.get("scnSseq") or s.get("prodNo") or time_raw,
+        })
     return available
 
 
-_debug_logged: set = set()  # 날짜별 최초 1회만 debug 출력
-_page_ready: bool = False   # CGV 페이지 초기 로드 여부
+# ── 날짜 확인 ───────────────────────────────────────────────────────────────
+
+_debug_logged: set = set()
 
 
-async def ensure_cgv_loaded(page: Page) -> None:
-    """CGV 메인 페이지를 한 번 로드해 JS fetch interceptor를 활성화합니다."""
-    global _page_ready
-    if not _page_ready or "cgv.co.kr" not in page.url or "login" in page.url:
-        print("[페이지] CGV 메인 로드 중...", flush=True)
-        await page.goto("https://cgv.co.kr/", wait_until="domcontentloaded", timeout=20000)
-        await page.wait_for_timeout(2000)
-        _page_ready = True
-
-
-async def check_date(page: Page, date: str) -> list:
-    """CGV 페이지 JS 컨텍스트에서 직접 fetch로 스케줄 API 호출.
-
-    /ticket URL이 404를 반환하는 문제를 우회합니다.
-    accessToken 쿠키를 Bearer 토큰으로 자동 사용하며,
-    페이지 내 CGV fetch 인터셉터가 x-signature를 자동으로 추가합니다.
+async def check_date(client: httpx.AsyncClient, token: str, date: str) -> tuple[list, str]:
     """
-    await ensure_cgv_loaded(page)
+    해당 날짜 스케줄 조회. 토큰 만료 시 갱신 후 재시도.
+    Returns (sessions, current_token)
+    """
+    resp = await fetch_schedule(client, token, date)
 
-    api_url = (
-        f"https://api.cgv.co.kr/cnm/atkt/searchSchByMov"
-        f"?coCd={CO_CD}&siteNo={SITE_NO}&scnYmd={date}"
-        f"&movNo={MOV_NO}&rtctlScopCd={RTCTL_SCOP_CD}"
-    )
+    if resp.status_code == 401:
+        print(f"[{date}] 401 → 토큰 갱신 시도...", flush=True)
+        token = await try_refresh_token(client, token)
+        resp = await fetch_schedule(client, token, date)
 
-    # page.evaluate(): CGV 페이지 컨텍스트에서 fetch 실행
-    # → 페이지 JS가 Authorization / x-signature 헤더를 자동 부착
-    result = await page.evaluate(f"""
-        async () => {{
-            try {{
-                const r = await fetch("{api_url}", {{ credentials: "include" }});
-                const body = await r.json();
-                return {{ status: r.status, body }};
-            }} catch(e) {{
-                return {{ error: String(e) }};
-            }}
-        }}
-    """)
+    if resp.status_code != 200:
+        print(f"[{date}] HTTP {resp.status_code}", flush=True)
+        return [], token
 
-    if result.get("error"):
-        print(f"[{date}] fetch 오류: {result['error']}", flush=True)
-        return []
+    body = resp.json()
+    status_code = body.get("statusCode")
 
-    http_status = result.get("status", 0)
-    body = result.get("body", {})
-    api_status = str(body.get("statusCode", ""))
+    # CGV API 성공 코드: 0 (정수)
+    if status_code != 0:
+        print(f"[{date}] API 오류: {status_code} — {body.get('statusMessage', '')}", flush=True)
+        return [], token
 
-    if http_status == 401 or api_status == "401":
-        print(f"[{date}] 401 — 세션 만료. 재로그인 필요", flush=True)
-        global _page_ready
-        _page_ready = False   # 다음 라운드에 재로드 유도
-        return []
+    data = body.get("data") or []
+    if not isinstance(data, list):
+        print(f"[{date}] data 형식 이상: {type(data)}", flush=True)
+        return [], token
 
-    if api_status == "200":
-        first_time = date not in _debug_logged
-        if first_time:
-            _debug_logged.add(date)
-        return parse_schedule(body, date, debug=first_time)
+    first_time = date not in _debug_logged
+    if first_time:
+        _debug_logged.add(date)
+        print(f"[{date}] 응답 {len(data)}개 세션 (전체, IMAX 필터 전)", flush=True)
 
-    # 스케줄 없음 (아직 오픈 전) 또는 다른 상태
-    msg = body.get("statusMessage", "")
-    print(f"[{date}] 스케줄 없음 (API {api_status or http_status} {msg})", flush=True)
-    return []
+    sessions = parse_schedule(data, date, debug=first_time)
+    return sessions, token
 
 
-async def process_results(sessions: list, date: str) -> int:
-    """새로 발견된 세션에 대해 알림 전송, 알림 수 반환"""
-    new_count = 0
+# ── 알림 전송 ───────────────────────────────────────────────────────────────
+
+async def process_results(sessions: list) -> None:
     for s in sessions:
-        sid = f"{date}_{s['session_id']}_{s['time']}"
+        sid = f"{s['date']}_{s['session_id']}_{s['time']}"
         if sid in notified_sessions:
             continue
         notified_sessions.add(sid)
-        new_count += 1
 
-        remain_str = f"{s['remain']}석" if s['remain'] else "좌석 있음"
         msg = (
             f"🎬 <b>CGV 용산IMAX 오픈!</b>\n\n"
-            f"📅 {s['date']} {s['time']}\n"
+            f"📅 {s['date']}  🕐 {s['time']}\n"
             f"🏛 {s['hall']}\n"
-            f"💺 잔여: {remain_str}"
-            + (f" / 총 {s['total']}석" if s['total'] else "")
-            + f"\n\n🔗 <a href='https://cgv.co.kr/ticket'>바로 예매</a>"
+            f"💺 잔여 {s['remain']}석 / 총 {s['total']}석\n\n"
+            f"🔗 <a href='https://cgv.co.kr/ticket'>바로 예매</a>"
         )
         await send_telegram(msg)
-        print(f"  → 알림 전송: {s['time']} ({remain_str})")
-
-    return new_count
+        print(f"  → 알림: {s['date']} {s['time']} 잔여 {s['remain']}석", flush=True)
 
 
-# ── 메인 루프 ──────────────────────────────────────────────────────────────
+# ── 메인 ────────────────────────────────────────────────────────────────────
 
 async def main():
     if not WATCH_DATES:
-        print("오류: .env 파일에 WATCH_DATES를 설정해주세요.")
-        print("예) WATCH_DATES=20260530,20260531")
+        print("오류: .env에 WATCH_DATES를 설정하세요.  예) WATCH_DATES=20260530,20260531")
+        sys.exit(1)
+
+    token = load_token()
+    if not token:
+        print("오류: .env에 BEARER_TOKEN을 설정하세요.")
+        print("  브라우저 DevTools → Network → searchSchByMov 요청 → Headers → authorization 값 복사")
         sys.exit(1)
 
     print("=" * 60)
-    print("  CGV 용산IMAX 좌석 오픈 알리미")
+    print("  CGV 용산IMAX 좌석 오픈 알리미  (직접 API 버전)")
     print(f"  영화: {MOV_NO} | 상영관 siteNo: {SITE_NO}")
     print(f"  감시 날짜: {', '.join(WATCH_DATES)}")
     print(f"  확인 주기: {CHECK_INTERVAL}초")
     print("=" * 60)
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=False,  # 로그인 확인을 위해 처음엔 창 표시
-            args=["--window-size=1200,800"]
-        )
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0"
-            ),
-            viewport={"width": 1200, "height": 800},
-            locale="ko-KR",
-        )
+    await send_telegram(
+        f"🔔 CGV 용산IMAX 알리미 시작\n"
+        f"감시 날짜: {', '.join(WATCH_DATES)}"
+    )
 
-        # 1) 저장된 쿠키로 세션 복원 시도
-        has_cookies = await load_cookies(context)
-        session_ok = False
-        if has_cookies:
-            check_page = await context.new_page()
-            session_ok = await check_session_valid(check_page)
-            await check_page.close()
+    async with httpx.AsyncClient() as client:
+        round_num = 0
+        while True:
+            round_num += 1
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"\n[{now}] 라운드 {round_num}", flush=True)
 
-        # 2) 세션 없으면 로그인
-        if not session_ok:
-            if CGV_ID and CGV_PW:
-                # env에 계정 정보 있으면 자동 로그인
-                session_ok = await auto_login(context)
-            if not session_ok:
-                # 자동 로그인 실패 or 계정 정보 없으면 수동 로그인
-                await manual_login(context)
-
-        print("\n[시작] 감시를 시작합니다. 브라우저 창을 닫지 마세요 (최소화는 OK).", flush=True)
-        print("[텔레그램] 시작 알림 전송 중...", flush=True)
-        await send_telegram(
-            f"🔔 CGV 용산IMAX 알리미 시작\n"
-            f"감시 날짜: {', '.join(WATCH_DATES)}\n"
-            f"확인 주기: {CHECK_INTERVAL}초"
-        )
-        print("[루프] 감시 루프 진입...", flush=True)
-
-        page = await context.new_page()
-
-        try:
-            round_num = 0
-            while True:
-                round_num += 1
-                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                print(f"\n[{now}] 라운드 {round_num} 확인 중...", flush=True)
-
-                # 세션 만료 감지: 로그인 페이지로 리다이렉트됐으면 재로그인
-                if "login" in page.url:
-                    print("[세션 만료] 재로그인 시도...")
-                    if CGV_ID and CGV_PW:
-                        await auto_login(context)
-                    else:
-                        await manual_login(context)
-
-                total_found = 0
-                for date in WATCH_DATES:
-                    sessions = await check_date(page, date)
+            for date in WATCH_DATES:
+                try:
+                    sessions, token = await check_date(client, token, date)
                     if sessions:
-                        print(f"  [{date}] {len(sessions)}개 세션 발견!")
-                        found = await process_results(sessions, date)
-                        total_found += found
+                        await process_results(sessions)
                     else:
-                        print(f"  [{date}] 예매 없음")
-                    await asyncio.sleep(1)
+                        print(f"  [{date}] IMAX 예매 없음", flush=True)
+                except Exception as e:
+                    print(f"  [{date}] 오류: {e}", flush=True)
+                await asyncio.sleep(1)
 
-                print(f"[완료] {CHECK_INTERVAL}초 후 재확인...", flush=True)
-                await asyncio.sleep(CHECK_INTERVAL)
-
-        except KeyboardInterrupt:
-            print("\n\n종료합니다.")
-        finally:
-            await save_cookies(context)
-            await browser.close()
+            print(f"[대기] {CHECK_INTERVAL}초 후 재확인...", flush=True)
+            await asyncio.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n종료합니다.")
