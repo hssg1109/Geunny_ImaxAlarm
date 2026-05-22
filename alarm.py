@@ -37,15 +37,21 @@ notified_sessions: set = set()
 
 async def send_telegram(message: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"[텔레그램 미설정] {message}")
+        print(f"[텔레그램 미설정] {message}", flush=True)
         return
     try:
         import telegram
         bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="HTML")
-        print(f"[텔레그램] 전송 완료")
+        # 10초 타임아웃: 네트워크 문제 시 무한 대기 방지
+        await asyncio.wait_for(
+            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="HTML"),
+            timeout=10.0
+        )
+        print("[텔레그램] 전송 완료", flush=True)
+    except asyncio.TimeoutError:
+        print("[텔레그램] 전송 타임아웃 (10초) — 계속 진행", flush=True)
     except Exception as e:
-        print(f"[텔레그램] 전송 실패: {e}")
+        print(f"[텔레그램] 전송 실패: {e}", flush=True)
 
 
 # ── 쿠키 저장/로드 ─────────────────────────────────────────────────────────
@@ -240,7 +246,7 @@ async def check_date(page: Page, date: str) -> list:
         try:
             await asyncio.wait_for(received.wait(), timeout=10.0)
         except asyncio.TimeoutError:
-            print(f"[{date}] API 응답 없음 (타임아웃) — 아직 스케줄 없을 수 있음")
+            print(f"[{date}] API 응답 없음 (타임아웃) — 아직 스케줄 없을 수 있음", flush=True)
     except Exception as e:
         print(f"[{date}] 페이지 오류: {type(e).__name__}: {e}")
     finally:
@@ -321,12 +327,14 @@ async def main():
                 # 자동 로그인 실패 or 계정 정보 없으면 수동 로그인
                 await manual_login(context)
 
-        print("\n[시작] 감시를 시작합니다. 브라우저 창을 닫지 마세요 (최소화는 OK).")
+        print("\n[시작] 감시를 시작합니다. 브라우저 창을 닫지 마세요 (최소화는 OK).", flush=True)
+        print("[텔레그램] 시작 알림 전송 중...", flush=True)
         await send_telegram(
             f"🔔 CGV 용산IMAX 알리미 시작\n"
             f"감시 날짜: {', '.join(WATCH_DATES)}\n"
             f"확인 주기: {CHECK_INTERVAL}초"
         )
+        print("[루프] 감시 루프 진입...", flush=True)
 
         page = await context.new_page()
 
@@ -335,7 +343,7 @@ async def main():
             while True:
                 round_num += 1
                 now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                print(f"\n[{now}] 라운드 {round_num} 확인 중...")
+                print(f"\n[{now}] 라운드 {round_num} 확인 중...", flush=True)
 
                 # 세션 만료 감지: 로그인 페이지로 리다이렉트됐으면 재로그인
                 if "login" in page.url:
@@ -356,7 +364,7 @@ async def main():
                         print(f"  [{date}] 예매 없음")
                     await asyncio.sleep(1)
 
-                print(f"[완료] {CHECK_INTERVAL}초 후 재확인...")
+                print(f"[완료] {CHECK_INTERVAL}초 후 재확인...", flush=True)
                 await asyncio.sleep(CHECK_INTERVAL)
 
         except KeyboardInterrupt:
