@@ -6,6 +6,9 @@ CGV 용산IMAX 좌석 오픈 알리미
 - x-signature: HMAC-SHA256("{timestamp}|{path}|{body}", SECRET_KEY) → Base64
 - SECRET_KEY: CGV JS 번들(module 74189)에서 추출
 - 토큰 만료(401 / statusCode -1001): reissue 엔드포인트로 자동 갱신
+
+[Cloudflare 우회]
+- curl_cffi 로 Chrome TLS 핑거프린트 흉내 → Cloudflare 봇 감지 통과
 """
 
 import asyncio
@@ -20,13 +23,14 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import httpx
+from curl_cffi.requests import AsyncSession
 from dotenv import load_dotenv
 
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_PROXY     = os.getenv("TELEGRAM_PROXY", "")   # 예) http://127.0.0.1:7890
 CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
 
 MOV_NO        = os.getenv("MOV_NO", "30001210")
@@ -38,6 +42,9 @@ WATCH_DATES   = [d.strip() for d in os.getenv("WATCH_DATES", "").split(",") if d
 
 # 브라우저 Application 탭 → Cookies → cgv.co.kr → accessToken 값
 ACCESS_TOKEN  = os.getenv("ACCESS_TOKEN", "")
+# 브라우저 DevTools → Network 탭 → CGV API 요청 선택 → Headers → cookie 값 전체 복사
+# cf_clearance, __cf_bm, accessToken 등이 포함되어야 Cloudflare 통과
+CGV_COOKIES   = os.getenv("CGV_COOKIES", "")
 
 TOKEN_FILE    = Path(__file__).parent / "token.json"
 
@@ -47,6 +54,9 @@ REISSUE_PATH   = "/com/bznsCom/custKeep/reissueToken"
 
 # CGV JS bundle(module 74189)에서 추출한 HMAC 서명 비밀키
 _HMAC_SECRET = "ydqXY0ocnFLmJGHr_zNzFcpjwAsXq_8JcBNURAkRscg"
+
+# curl_cffi impersonate 대상 (Chrome 최신 → Cloudflare 통과)
+_IMPERSONATE = "chrome124"
 
 notified_sessions: set = set()
 
@@ -76,20 +86,18 @@ def current_timestamp() -> str:
 def make_headers(token: str, path: str, body: str = "") -> dict:
     ts  = current_timestamp()
     sig = make_signature(path, body, ts)
-    return {
+    headers = {
         "accept":           "application/json",
-        "accept-language":  "ko-KR",
+        "accept-language":  "ko-KR,ko;q=0.9",
         "authorization":    f"Bearer {token}",
         "origin":           "https://cgv.co.kr",
         "referer":          "https://cgv.co.kr/",
         "x-timestamp":      ts,
         "x-signature":      sig,
-        "user-agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0"
-        ),
     }
+    if CGV_COOKIES:
+        headers["cookie"] = CGV_COOKIES
+    return headers
 
 
 # ── 토큰 저장/로드 ─────────────────────────────────────────────────────────
@@ -113,18 +121,22 @@ def load_token() -> str:
 
 # ── 토큰 갱신 ─────────────────────────────────────────────────────────────
 
-async def reissue_token(client: httpx.AsyncClient, current_token: str) -> str:
+async def reissue_token(client: AsyncSession, current_token: str) -> str:
     """
     CGV 토큰 갱신 (401 / statusCode -1001 발생 시 호출)
-    JS 분석 결과: p({accessToken}) → data.accessToken
+    JS 분석 결과: POST {accessToken} → data.accessToken
     """
     print("[토큰] 갱신 시도...", flush=True)
+    payload = json.dumps({"accessToken": current_token})
     try:
         resp = await client.post(
             CGV_API_BASE + REISSUE_PATH,
-            json={"accessToken": current_token},
-            headers=make_headers(current_token, REISSUE_PATH, json.dumps({"accessToken": current_token})),
-            timeout=10.0,
+            content=payload,
+            headers={
+                **make_headers(current_token, REISSUE_PATH, payload),
+                "content-type": "application/json",
+            },
+            timeout=10,
         )
         body = resp.json()
         new_token = (body.get("data") or {}).get("accessToken")
@@ -143,21 +155,24 @@ async def reissue_token(client: httpx.AsyncClient, current_token: str) -> str:
 # ── Telegram ────────────────────────────────────────────────────────────────
 
 async def send_telegram(message: str) -> None:
+    """curl_cffi 로 Telegram Bot API 직접 호출"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print(f"[텔레그램 미설정] {message}", flush=True)
         return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+    kwargs: dict = {"timeout": 10}
+    if TELEGRAM_PROXY:
+        kwargs["proxies"] = {"https": TELEGRAM_PROXY, "http": TELEGRAM_PROXY}
     try:
-        import telegram
-        bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
-        await asyncio.wait_for(
-            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="HTML"),
-            timeout=10.0,
-        )
-        print("[텔레그램] 전송 완료", flush=True)
-    except asyncio.TimeoutError:
-        print("[텔레그램] 전송 타임아웃 — 계속 진행", flush=True)
+        async with AsyncSession(impersonate=_IMPERSONATE) as s:
+            resp = await s.post(url, json=payload, **kwargs)
+        if resp.status_code == 200:
+            print("[텔레그램] 전송 완료", flush=True)
+        else:
+            print(f"[텔레그램] 전송 실패: HTTP {resp.status_code} → {resp.text[:200]}", flush=True)
     except Exception as e:
-        print(f"[텔레그램] 전송 실패: {e}", flush=True)
+        print(f"[텔레그램] 전송 실패: {type(e).__name__}: {e}", flush=True)
 
 
 # ── 파싱 ────────────────────────────────────────────────────────────────────
@@ -209,12 +224,12 @@ def parse_schedule(data: list, date: str) -> list:
 
 # ── API 호출 ────────────────────────────────────────────────────────────────
 
-async def fetch_schedule(client: httpx.AsyncClient, token: str, date: str) -> httpx.Response:
+async def fetch_schedule(client: AsyncSession, token: str, date: str):
     params: dict = {
-        "coCd":       CO_CD,
-        "siteNo":     SITE_NO,
-        "scnYmd":     date,
-        "movNo":      MOV_NO,
+        "coCd":        CO_CD,
+        "siteNo":      SITE_NO,
+        "scnYmd":      date,
+        "movNo":       MOV_NO,
         "rtctlScopCd": RTCTL_SCOP_CD,
     }
     if CUST_NO:
@@ -224,22 +239,33 @@ async def fetch_schedule(client: httpx.AsyncClient, token: str, date: str) -> ht
         CGV_API_BASE + SCHEDULE_PATH,
         params=params,
         headers=make_headers(token, SCHEDULE_PATH),
-        timeout=15.0,
+        timeout=15,
     )
 
 
-async def check_date(client: httpx.AsyncClient, token: str, date: str) -> tuple[list, str]:
+async def check_date(client: AsyncSession, token: str, date: str) -> tuple[list, str]:
     resp = await fetch_schedule(client, token, date)
 
     # 401: 토큰 만료 → 갱신 후 재시도
     if resp.status_code == 401:
-        body = resp.json()
-        if body.get("statusCode") in (-1001, "-1001"):
-            token = await reissue_token(client, token)
-            resp  = await fetch_schedule(client, token, date)
+        try:
+            body = resp.json()
+            if body.get("statusCode") in (-1001, "-1001"):
+                token = await reissue_token(client, token)
+                resp  = await fetch_schedule(client, token, date)
+        except Exception:
+            pass
 
     if resp.status_code != 200:
-        print(f"[{date}] HTTP {resp.status_code}", flush=True)
+        try:
+            body_text = resp.text[:600]
+        except Exception:
+            body_text = "(응답 본문 읽기 실패)"
+        cf_ray = resp.headers.get("cf-ray", "")
+        server = resp.headers.get("server", "")
+        ct     = resp.headers.get("content-type", "")
+        print(f"[{date}] HTTP {resp.status_code}  server={server}  cf-ray={cf_ray}  content-type={ct}", flush=True)
+        print(f"[{date}] 응답 본문: {body_text}", flush=True)
         return [], token
 
     body = resp.json()
@@ -292,9 +318,16 @@ async def main():
     print(f"  영화: {MOV_NO} | 상영관 siteNo: {SITE_NO}")
     print(f"  감시 날짜: {', '.join(WATCH_DATES)}")
     print(f"  확인 주기: {CHECK_INTERVAL}초")
+    print(f"  TLS 핑거프린트: {_IMPERSONATE}")
+    if TELEGRAM_BOT_TOKEN:
+        print(f"  텔레그램 봇: ...{TELEGRAM_BOT_TOKEN[-6:]}")
+        print(f"  텔레그램 채팅ID: {TELEGRAM_CHAT_ID}")
+        if TELEGRAM_PROXY:
+            print(f"  텔레그램 프록시: {TELEGRAM_PROXY}")
+    else:
+        print("  텔레그램: 미설정 (콘솔 출력만)")
     print("=" * 60)
 
-    # 서명 생성 확인
     ts  = current_timestamp()
     sig = make_signature(SCHEDULE_PATH, "", ts)
     print(f"[서명 테스트] ts={ts}  sig={sig[:20]}...", flush=True)
@@ -303,7 +336,7 @@ async def main():
         f"🔔 CGV 용산IMAX 알리미 시작\n감시 날짜: {', '.join(WATCH_DATES)}"
     )
 
-    async with httpx.AsyncClient() as client:
+    async with AsyncSession(impersonate=_IMPERSONATE) as client:
         round_num = 0
         while True:
             round_num += 1
