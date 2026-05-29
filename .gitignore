@@ -1,5 +1,7 @@
 .env
 cgv_session.json
+config.json
+token.json
 __pycache__/
 *.pyc
 *.pyo
