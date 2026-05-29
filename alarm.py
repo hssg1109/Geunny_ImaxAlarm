@@ -29,10 +29,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
-TELEGRAM_PROXY     = os.getenv("TELEGRAM_PROXY", "")
-CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
+TELEGRAM_BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_PROXY       = os.getenv("TELEGRAM_PROXY", "")
+DISCORD_WEBHOOK_URL  = os.getenv("DISCORD_WEBHOOK_URL", "")  # Discord 채널 Webhook URL
+CHECK_INTERVAL       = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
 
 MOV_NO        = os.getenv("MOV_NO", "30001210")
 SITE_NO       = os.getenv("SITE_NO", "0013")
@@ -138,7 +139,6 @@ async def reissue_token(client: AsyncSession, current_token: str) -> str:
 
 async def send_telegram(message: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"[텔레그램 미설정] {message}", flush=True)
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
@@ -154,6 +154,40 @@ async def send_telegram(message: str) -> None:
             print(f"[텔레그램] 전송 실패: HTTP {resp.status_code} → {resp.text[:200]}", flush=True)
     except Exception as e:
         print(f"[텔레그램] 전송 실패: {type(e).__name__}: {e}", flush=True)
+
+
+def _html_to_discord(html: str) -> str:
+    """HTML 태그를 Discord 마크다운으로 변환"""
+    import re
+    text = html.replace("<b>", "**").replace("</b>", "**")
+    text = re.sub(r"<a href='([^']+)'>([^<]+)</a>", r"[\2](\1)", text)
+    return text
+
+
+async def send_discord(message: str) -> None:
+    if not DISCORD_WEBHOOK_URL:
+        return
+    try:
+        async with AsyncSession(impersonate=_IMPERSONATE) as s:
+            resp = await s.post(
+                DISCORD_WEBHOOK_URL,
+                json={"content": _html_to_discord(message)},
+                timeout=10,
+            )
+        if resp.status_code in (200, 204):
+            print("[디스코드] 전송 완료", flush=True)
+        else:
+            print(f"[디스코드] 전송 실패: HTTP {resp.status_code} → {resp.text[:200]}", flush=True)
+    except Exception as e:
+        print(f"[디스코드] 전송 실패: {type(e).__name__}: {e}", flush=True)
+
+
+async def notify(message: str) -> None:
+    """설정된 모든 채널로 알림 전송"""
+    await asyncio.gather(
+        send_telegram(message),
+        send_discord(message),
+    )
 
 
 # ── 스케줄 파싱 ──────────────────────────────────────────────────────────────
@@ -285,7 +319,7 @@ async def process_results(sessions: list, client: AsyncSession, token: str) -> N
             f"{zone_lines}\n\n"
             f"🔗 <a href='https://cgv.co.kr/ticket'>바로 예매</a>"
         )
-        await send_telegram(msg)
+        await notify(msg)
         print(f"  → 알림: {s['date']} {s['time']} 잔여 {s['remain']}석", flush=True)
 
 
@@ -365,20 +399,21 @@ async def main():
     print(f"  감시 날짜: {', '.join(WATCH_DATES)}")
     print(f"  확인 주기: {CHECK_INTERVAL}초")
     print(f"  TLS 핑거프린트: {_IMPERSONATE}")
+    if DISCORD_WEBHOOK_URL:
+        print(f"  디스코드 Webhook: ...{DISCORD_WEBHOOK_URL[-12:]}")
     if TELEGRAM_BOT_TOKEN:
         print(f"  텔레그램 봇: ...{TELEGRAM_BOT_TOKEN[-6:]}")
-        print(f"  텔레그램 채팅ID: {TELEGRAM_CHAT_ID}")
         if TELEGRAM_PROXY:
             print(f"  텔레그램 프록시: {TELEGRAM_PROXY}")
-    else:
-        print("  텔레그램: 미설정 (콘솔 출력만)")
+    if not DISCORD_WEBHOOK_URL and not TELEGRAM_BOT_TOKEN:
+        print("  알림: 미설정 (콘솔 출력만)")
     print("=" * 60)
 
     ts  = current_timestamp()
     sig = make_signature(SCHEDULE_PATH, "", ts)
     print(f"[서명 테스트] ts={ts}  sig={sig[:20]}...", flush=True)
 
-    await send_telegram(
+    await notify(
         f"🔔 CGV 용산IMAX 알리미 시작\n감시 날짜: {', '.join(WATCH_DATES)}"
     )
 
