@@ -9,6 +9,9 @@ CGV 용산IMAX 좌석 오픈 알리미
 
 [Cloudflare 우회]
 - curl_cffi 로 Chrome TLS 핑거프린트 흉내 → Cloudflare 봇 감지 통과
+
+[명당 알림 조건]
+- F~J열, 17~28번 좌석 중 빈 좌석이 새로 생겼을 때만 알림
 """
 
 import asyncio
@@ -23,7 +26,7 @@ import re
 import sys
 import threading
 import time
-from collections import Counter
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -32,11 +35,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-TELEGRAM_BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID", "")
-TELEGRAM_PROXY       = os.getenv("TELEGRAM_PROXY", "")
-DISCORD_WEBHOOK_URL  = os.getenv("DISCORD_WEBHOOK_URL", "")  # Discord 채널 Webhook URL
-CHECK_INTERVAL       = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
+TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_PROXY      = os.getenv("TELEGRAM_PROXY", "")
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
+CHECK_INTERVAL      = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
 
 MOV_NO        = os.getenv("MOV_NO", "30001210")
 SITE_NO       = os.getenv("SITE_NO", "0013")
@@ -50,15 +53,22 @@ CGV_COOKIES  = os.getenv("CGV_COOKIES", "")
 
 TOKEN_FILE = Path(__file__).parent / "token.json"
 
-CGV_API_BASE    = "https://api.cgv.co.kr"
-SCHEDULE_PATH   = "/cnm/atkt/searchSchByMov"
-SEAT_PATH       = "/cnm/atkt/searchIfSeatData"
-REISSUE_PATH    = "/com/bznsCom/custKeep/reissueToken"
+CGV_API_BASE  = "https://api.cgv.co.kr"
+SCHEDULE_PATH = "/cnm/atkt/searchSchByMov"
+SEAT_PATH     = "/cnm/atkt/searchIfSeatData"
+REISSUE_PATH  = "/com/bznsCom/custKeep/reissueToken"
 
 _HMAC_SECRET = "ydqXY0ocnFLmJGHr_zNzFcpjwAsXq_8JcBNURAkRscg"
 _IMPERSONATE = "chrome124"
 
-notified_sessions: set = set()
+# ── 명당 좌석 조건 ────────────────────────────────────────────────────────────
+PRIME_ROWS     = {"F", "G", "H", "I", "J"}
+PRIME_SEAT_MIN = 17
+PRIME_SEAT_MAX = 28
+
+# session_key → 이전 라운드의 예매가능 명당 좌석 set{(row, seat_no)}
+# None = 아직 한 번도 조회 안 함
+prime_seat_state: dict[str, set | None] = defaultdict(lambda: None)
 
 
 # ── 서명 / 헤더 ─────────────────────────────────────────────────────────────
@@ -138,49 +148,38 @@ async def reissue_token(client: AsyncSession, current_token: str) -> str:
     return current_token
 
 
-# ── Telegram ────────────────────────────────────────────────────────────────
+# ── 알림 채널 ────────────────────────────────────────────────────────────────
 
 async def send_telegram(message: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     kwargs: dict = {"timeout": 10}
     if TELEGRAM_PROXY:
         kwargs["proxies"] = {"https": TELEGRAM_PROXY, "http": TELEGRAM_PROXY}
     try:
         async with AsyncSession(impersonate=_IMPERSONATE) as s:
-            resp = await s.post(url, json=payload, **kwargs)
+            resp = await s.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}, **kwargs)
         if resp.status_code == 200:
             print("[텔레그램] 전송 완료", flush=True)
         else:
-            print(f"[텔레그램] 전송 실패: HTTP {resp.status_code} → {resp.text[:200]}", flush=True)
+            print(f"[텔레그램] 전송 실패: HTTP {resp.status_code}", flush=True)
     except Exception as e:
         print(f"[텔레그램] 전송 실패: {type(e).__name__}: {e}", flush=True)
-
-
-def _html_to_discord(html: str) -> str:
-    """HTML 태그를 Discord 마크다운으로 변환"""
-    import re
-    text = html.replace("<b>", "**").replace("</b>", "**")
-    text = re.sub(r"<a href='([^']+)'>([^<]+)</a>", r"[\2](\1)", text)
-    return text
 
 
 async def send_discord(message: str) -> None:
     if not DISCORD_WEBHOOK_URL:
         return
+    text = re.sub(r"<a href='([^']+)'>([^<]+)</a>", r"[\2](\1)",
+           message.replace("<b>", "**").replace("</b>", "**"))
     try:
         async with AsyncSession(impersonate=_IMPERSONATE) as s:
-            resp = await s.post(
-                DISCORD_WEBHOOK_URL,
-                json={"content": _html_to_discord(message)},
-                timeout=10,
-            )
+            resp = await s.post(DISCORD_WEBHOOK_URL, json={"content": text}, timeout=10)
         if resp.status_code in (200, 204):
             print("[디스코드] 전송 완료", flush=True)
         else:
-            print(f"[디스코드] 전송 실패: HTTP {resp.status_code} → {resp.text[:200]}", flush=True)
+            print(f"[디스코드] 전송 실패: HTTP {resp.status_code}", flush=True)
     except Exception as e:
         print(f"[디스코드] 전송 실패: {type(e).__name__}: {e}", flush=True)
 
@@ -192,35 +191,30 @@ async def send_windows_alert(message: str) -> None:
 
     plain = re.sub(r"<[^>]+>", "", message).strip()
 
-    # 경고음 (winsound 내장 모듈)
     try:
         import winsound
         loop = asyncio.get_event_loop()
         for _ in range(5):
-            await loop.run_in_executor(
-                None, winsound.Beep, 1000, 300  # 1000Hz, 300ms
-            )
+            await loop.run_in_executor(None, winsound.Beep, 1000, 300)
             await asyncio.sleep(0.2)
     except Exception as e:
         print(f"[윈도우] 경고음 실패: {e}", flush=True)
 
-    # 토스트 알림 (win11toast 설치 시)
     try:
         from win11toast import toast_async
-        await toast_async("🎬 CGV 용산IMAX 오픈!", plain[:120])
+        await toast_async("🎬 CGV 용산IMAX 명당 오픈!", plain[:150])
         print("[윈도우] 토스트 알림 전송", flush=True)
         return
     except ImportError:
-        pass  # win11toast 없으면 팝업으로 대체
+        pass
     except Exception as e:
         print(f"[윈도우] 토스트 실패: {e}", flush=True)
 
-    # 팝업 대체 (win11toast 없을 때, 비동기 처리)
     try:
         import ctypes
         threading.Thread(
             target=ctypes.windll.user32.MessageBoxW,
-            args=(0, plain[:300], "🎬 CGV 용산IMAX 오픈!", 0x30 | 0x1000),
+            args=(0, plain[:300], "🎬 CGV 용산IMAX 명당 오픈!", 0x30 | 0x1000),
             daemon=True,
         ).start()
         print("[윈도우] 팝업 알림 표시", flush=True)
@@ -243,47 +237,49 @@ _debug_logged: set = set()
 
 
 def parse_schedule(data: list, date: str) -> list:
+    """IMAX 세션 전체 반환 (frSeatCnt 무관 — 명당 변화 감지를 위해)"""
     first = date not in _debug_logged
     if first:
         _debug_logged.add(date)
         if data:
             print(f"[{date}] DEBUG 첫 응답 필드: {list(data[0].keys())[:15]}", flush=True)
 
-    available = []
+    sessions = []
     for s in data:
         hall = s.get("scnsNm") or s.get("expoScnsNm") or ""
         if "imax" not in hall.lower() and "아이맥스" not in hall:
             continue
 
-        remain = int(s.get("frSeatCnt") or s.get("cpSeatCnt") or 0)
-        total  = int(s.get("stcnt") or 0)
-        if remain <= 0:
-            continue
-
         t = s.get("scnsrtTm") or s.get("rlMovStartTm") or "?"
         time_fmt = f"{t[:2]}:{t[2:]}" if len(t) == 4 else t
 
-        available.append({
+        sessions.append({
             "date":       date,
             "time":       time_fmt,
-            "remain":     remain,
-            "total":      total,
             "hall":       hall,
-            "scns_no":    s.get("scnsNo", ""),       # 좌석 상세 조회용
+            "scns_no":    s.get("scnsNo", ""),
             "session_id": s.get("scnSseq") or t,
+            "total":      int(s.get("stcnt") or 0),
         })
-    return available
+    return sessions
 
 
-# ── 좌석 상세 조회 ────────────────────────────────────────────────────────────
+# ── 좌석 상세 조회 + 명당 필터 ───────────────────────────────────────────────
 
-async def fetch_seat_detail(
+def _is_prime(row: str, seat_no_str: str) -> bool:
+    try:
+        return row in PRIME_ROWS and PRIME_SEAT_MIN <= int(seat_no_str) <= PRIME_SEAT_MAX
+    except (ValueError, TypeError):
+        return False
+
+
+async def fetch_prime_seats(
     client: AsyncSession, token: str,
     date: str, scns_no: str, scn_sseq: str,
-) -> dict | None:
+) -> set | None:
     """
-    searchIfSeatData → 구역별 예매가능 좌석 수 반환
-    seatSaleYn == 'Y' 인 좌석이 예매 가능
+    searchIfSeatData → 예매가능 명당 좌석 set{(row, seat_no)} 반환
+    API 실패 시 None 반환 (상태 미업데이트)
     """
     params = {
         "coCd":       CO_CD,
@@ -315,59 +311,83 @@ async def fetch_seat_detail(
             return None
 
         seats = items[0].get("seats", [])
-        avail = [s for s in seats if s.get("seatSaleYn") == "Y"]
-
-        zones = Counter(s.get("szoneNm") or "기타" for s in avail)
-
         return {
-            "total":    len(seats),
-            "avail":    len(avail),
-            "zones":    dict(zones),          # {"Light존": 120, "Extreme존": 110, ...}
+            (s["seatRowNm"], s["seatNo"])
+            for s in seats
+            if s.get("seatSaleYn") == "Y"
+            and _is_prime(s.get("seatRowNm", ""), s.get("seatNo", ""))
         }
     except Exception as e:
         print(f"[좌석상세] 조회 실패: {e}", flush=True)
         return None
 
 
-# ── 알림 ─────────────────────────────────────────────────────────────────────
+# ── 명당 변화 감지 + 알림 ────────────────────────────────────────────────────
 
-async def process_results(sessions: list, client: AsyncSession, token: str) -> None:
+def _format_prime_seats(seats: set) -> str:
+    """명당 좌석을 열별로 정렬해서 문자열로 변환"""
+    by_row: dict[str, list] = defaultdict(list)
+    for row, no in seats:
+        by_row[row].append(int(no))
+    lines = []
+    for row in sorted(by_row):
+        nums = sorted(by_row[row])
+        lines.append(f"  {row}열: {', '.join(str(n) for n in nums)}번")
+    return "\n".join(lines)
+
+
+async def process_sessions(sessions: list, client: AsyncSession, token: str) -> None:
     for s in sessions:
-        sid = f"{s['date']}_{s['session_id']}_{s['time']}"
-        if sid in notified_sessions:
+        if not s.get("scns_no"):
             continue
-        notified_sessions.add(sid)
 
-        # 좌석 상세 조회 (scns_no 있을 때만)
-        detail = None
-        if s.get("scns_no"):
-            detail = await fetch_seat_detail(
-                client, token,
-                s["date"], s["scns_no"], str(s["session_id"])
-            )
-            await asyncio.sleep(0.5)  # API 연속 호출 간격
+        session_key = f"{s['date']}_{s['session_id']}"
 
-        # 메시지 조합
-        seat_line = f"💺 잔여 {s['remain']}석 / 총 {s['total']}석"
-        zone_lines = ""
-        if detail:
-            seat_line = f"💺 예매가능 {detail['avail']}석 / 총 {detail['total']}석"
-            if detail["zones"]:
-                zone_lines = "\n\n📊 <b>구역별 현황</b>\n" + "\n".join(
-                    f"  · {zone}: {cnt}석"
-                    for zone, cnt in sorted(detail["zones"].items(), key=lambda x: -x[1])
-                )
+        current = await fetch_prime_seats(
+            client, token,
+            s["date"], s["scns_no"], str(s["session_id"])
+        )
+        await asyncio.sleep(0.5)
+
+        if current is None:
+            # API 실패 → 상태 유지, 알림 없음
+            continue
+
+        prev = prime_seat_state[session_key]  # None = 첫 조회
+
+        if prev is None:
+            # 첫 조회: 명당 있으면 바로 알림
+            newly = current
+        else:
+            # 이전에 없었다가 새로 생긴 명당만
+            newly = current - prev
+
+        prime_seat_state[session_key] = current
+
+        # 콘솔에 현황 출력
+        print(
+            f"  [{s['date']} {s['time']}] 명당 {len(current)}석 "
+            f"(새로 열림: {len(newly)}석)",
+            flush=True,
+        )
+
+        if not newly:
+            continue
+
+        seat_str = _format_prime_seats(newly)
+        total_str = _format_prime_seats(current) if current != newly else seat_str
 
         msg = (
-            f"🎬 <b>CGV 용산IMAX 오픈!</b>\n\n"
+            f"🎯 <b>CGV 용산IMAX 명당 오픈!</b>\n\n"
             f"📅 {s['date']}  🕐 {s['time']}\n"
-            f"🏛 {s['hall']}\n"
-            f"{seat_line}"
-            f"{zone_lines}\n\n"
+            f"🏛 {s['hall']}\n\n"
+            f"✨ <b>새로 열린 명당 좌석</b> (F~J열 17~28번)\n"
+            f"{seat_str}\n\n"
+            f"💺 현재 명당 총 {len(current)}석 예매가능\n\n"
             f"🔗 <a href='https://cgv.co.kr/ticket'>바로 예매</a>"
         )
         await notify(msg)
-        print(f"  → 알림: {s['date']} {s['time']} 잔여 {s['remain']}석", flush=True)
+        print(f"  → 명당 알림 전송: {s['date']} {s['time']}", flush=True)
 
 
 # ── 스케줄 API 호출 ──────────────────────────────────────────────────────────
@@ -409,9 +429,8 @@ async def check_date(client: AsyncSession, token: str, date: str) -> tuple[list,
             body_text = "(응답 본문 읽기 실패)"
         cf_ray = resp.headers.get("cf-ray", "")
         server = resp.headers.get("server", "")
-        ct     = resp.headers.get("content-type", "")
-        print(f"[{date}] HTTP {resp.status_code}  server={server}  cf-ray={cf_ray}  content-type={ct}", flush=True)
-        print(f"[{date}] 응답 본문: {body_text}", flush=True)
+        print(f"[{date}] HTTP {resp.status_code}  server={server}  cf-ray={cf_ray}", flush=True)
+        print(f"[{date}] 응답: {body_text}", flush=True)
         return [], token
 
     body = resp.json()
@@ -423,8 +442,9 @@ async def check_date(client: AsyncSession, token: str, date: str) -> tuple[list,
     if not isinstance(data, list):
         return [], token
 
-    print(f"[{date}] 전체 {len(data)}개 세션 (IMAX 필터 전)", flush=True)
-    return parse_schedule(data, date), token
+    sessions = parse_schedule(data, date)
+    print(f"[{date}] IMAX 세션 {len(sessions)}개", flush=True)
+    return sessions, token
 
 
 # ── 메인 ─────────────────────────────────────────────────────────────────────
@@ -437,7 +457,6 @@ async def main():
     token = load_token()
     if not token:
         print("오류: .env에 ACCESS_TOKEN 설정 필요")
-        print("  브라우저 DevTools → Application → Cookies → cgv.co.kr → accessToken 값 복사")
         sys.exit(1)
 
     print("=" * 60)
@@ -445,21 +464,17 @@ async def main():
     print(f"  영화: {MOV_NO} | 상영관 siteNo: {SITE_NO}")
     print(f"  감시 날짜: {', '.join(WATCH_DATES)}")
     print(f"  확인 주기: {CHECK_INTERVAL}초")
-    print(f"  TLS 핑거프린트: {_IMPERSONATE}")
+    print(f"  명당 조건: {sorted(PRIME_ROWS)}열  {PRIME_SEAT_MIN}~{PRIME_SEAT_MAX}번")
     if DISCORD_WEBHOOK_URL:
         print(f"  디스코드 Webhook: ...{DISCORD_WEBHOOK_URL[-12:]}")
     if TELEGRAM_BOT_TOKEN:
         print(f"  텔레그램 봇: ...{TELEGRAM_BOT_TOKEN[-6:]}")
-        if TELEGRAM_PROXY:
-            print(f"  텔레그램 프록시: {TELEGRAM_PROXY}")
     if platform.system() == "Windows":
         try:
             import win11toast  # noqa: F401
             print("  윈도우 알림: 토스트 + 경고음")
         except ImportError:
-            print("  윈도우 알림: 팝업 + 경고음  (토스트 원하면: pip install win11toast)")
-    if not DISCORD_WEBHOOK_URL and not TELEGRAM_BOT_TOKEN:
-        print("  외부 알림: 미설정")
+            print("  윈도우 알림: 팝업 + 경고음")
     print("=" * 60)
 
     ts  = current_timestamp()
@@ -467,7 +482,9 @@ async def main():
     print(f"[서명 테스트] ts={ts}  sig={sig[:20]}...", flush=True)
 
     await notify(
-        f"🔔 CGV 용산IMAX 알리미 시작\n감시 날짜: {', '.join(WATCH_DATES)}"
+        f"🔔 CGV 용산IMAX 알리미 시작\n"
+        f"감시 날짜: {', '.join(WATCH_DATES)}\n"
+        f"명당 조건: {sorted(PRIME_ROWS)}열 {PRIME_SEAT_MIN}~{PRIME_SEAT_MAX}번"
     )
 
     async with AsyncSession(impersonate=_IMPERSONATE) as client:
@@ -481,9 +498,9 @@ async def main():
                 try:
                     sessions, token = await check_date(client, token, date)
                     if sessions:
-                        await process_results(sessions, client, token)
+                        await process_sessions(sessions, client, token)
                     else:
-                        print(f"  [{date}] IMAX 예매 없음", flush=True)
+                        print(f"  [{date}] IMAX 세션 없음", flush=True)
                 except Exception as e:
                     print(f"  [{date}] 오류: {e}", flush=True)
                 await asyncio.sleep(1)
