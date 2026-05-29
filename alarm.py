@@ -210,10 +210,16 @@ async def send_discord(message: str) -> None:
         print(f"[디스코드] 전송 실패: {type(e).__name__}: {e}", flush=True)
 
 
-async def send_windows_alert(message: str) -> None:
+async def send_windows_alert(
+    message: str,
+    toast_title: str = "",
+    toast_body: str = "",
+) -> None:
     if platform.system() != "Windows":
         return
     plain = re.sub(r"<[^>]+>", "", message).strip()
+    title = toast_title or "🎯 CGV IMAX 명당 오픈!"
+    body  = toast_body  or plain
     try:
         import winsound
         loop = asyncio.get_event_loop()
@@ -224,7 +230,7 @@ async def send_windows_alert(message: str) -> None:
         print(f"[윈도우] 경고음 실패: {e}", flush=True)
     try:
         from win11toast import toast_async
-        await toast_async("🎯 CGV IMAX 명당 오픈!", plain[:150])
+        await toast_async(title, body)
         print("[윈도우] 토스트 알림 전송", flush=True)
         return
     except ImportError:
@@ -235,7 +241,7 @@ async def send_windows_alert(message: str) -> None:
         import ctypes
         threading.Thread(
             target=ctypes.windll.user32.MessageBoxW,
-            args=(0, plain[:300], "🎯 CGV IMAX 명당 오픈!", 0x30 | 0x1000),
+            args=(0, f"{title}\n\n{body}"[:400], "🎯 CGV IMAX 명당 오픈!", 0x30 | 0x1000),
             daemon=True,
         ).start()
         print("[윈도우] 팝업 알림 표시", flush=True)
@@ -243,11 +249,15 @@ async def send_windows_alert(message: str) -> None:
         print(f"[윈도우] 팝업 실패: {e}", flush=True)
 
 
-async def notify(message: str) -> None:
+async def notify(
+    message: str,
+    toast_title: str = "",
+    toast_body: str = "",
+) -> None:
     await asyncio.gather(
         # send_telegram(message),   # 사내망 차단 - 비활성화
         # send_discord(message),    # 사내망 차단 - 비활성화
-        send_windows_alert(message),
+        send_windows_alert(message, toast_title, toast_body),
     )
 
 
@@ -588,6 +598,23 @@ async def process_sessions(
             continue
 
         seat_str = _format_prime_seats(newly)
+
+        # 토스트용 한 줄 좌석 요약: "G열 19·20번 / H열 22번"
+        by_row_new: dict[str, list] = defaultdict(list)
+        for row, no in newly:
+            by_row_new[row].append(int(no))
+        seat_compact = " / ".join(
+            f"{row}열 {'·'.join(str(n) for n in sorted(nums))}번"
+            for row, nums in sorted(by_row_new.items())
+        )
+
+        toast_title = f"🎯 명당 오픈 — {mov_name}"
+        toast_body  = (
+            f"📅 {s['date']}  🕐 {s['time']}  |  {s['hall']}\n"
+            f"열린 좌석: {seat_compact}\n"
+            f"💺 현재 명당 {len(current)}석 예매 가능"
+        )
+
         msg = (
             f"🎯 <b>CGV IMAX 명당 오픈!</b>\n\n"
             f"🎬 {mov_name}\n"
@@ -598,7 +625,7 @@ async def process_sessions(
             f"💺 명당 총 {len(current)}석 예매가능\n\n"
             f"🔗 <a href='https://cgv.co.kr/ticket'>바로 예매</a>"
         )
-        await notify(msg)
+        await notify(msg, toast_title=toast_title, toast_body=toast_body)
         print(f"  → 명당 알림: {s['date']} {s['time']}", flush=True)
 
 
