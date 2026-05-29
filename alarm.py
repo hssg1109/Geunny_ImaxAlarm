@@ -68,7 +68,7 @@ DEFAULT_CONFIG = {
     "rtctl_scop_cd":  "08",
     "watch_dates":    [],
     "watch_times":    [],
-    "prime_rows":     ["F", "G", "H", "I", "J"],
+    "prime_rows":     ["F", "G", "H", "I", "J", "K", "L"],
     "prime_seat_min": 17,
     "prime_seat_max": 28,
 }
@@ -585,9 +585,18 @@ async def process_sessions(
         if current is None:
             continue
 
-        prev  = prime_seat_state[session_key]
-        newly = current if prev is None else (current - prev)
+        prev = prime_seat_state[session_key]
         prime_seat_state[session_key] = current
+
+        if prev is None:
+            # 첫 조회: 현재 상태 기록만, 알림 없음
+            print(
+                f"  [{s['date']} {s['time']}] 초기화 — 명당 {len(current)}석 확인",
+                flush=True,
+            )
+            continue
+
+        newly = current - prev
 
         print(
             f"  [{s['date']} {s['time']}] 명당 {len(current)}석 (새로 열림: {len(newly)}석)",
