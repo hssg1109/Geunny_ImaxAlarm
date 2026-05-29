@@ -73,7 +73,6 @@ DEFAULT_CONFIG = {
     "prime_seat_max": 28,
 }
 
-prime_seat_state: dict[str, set | None] = defaultdict(lambda: None)
 
 
 # ── config.json ───────────────────────────────────────────────────────────────
@@ -550,7 +549,7 @@ async def fetch_prime_seats(
         return None
 
 
-# ── 명당 변화 감지 + 알림 ────────────────────────────────────────────────────
+# ── 명당 감지 + 알림 ─────────────────────────────────────────────────────────
 
 def _format_prime_seats(seats: set) -> str:
     by_row: dict[str, list] = defaultdict(list)
@@ -573,7 +572,6 @@ async def process_sessions(
     for s in sessions:
         if not s.get("scns_no"):
             continue
-        session_key = f"{s['date']}_{s['session_id']}"
 
         current = await fetch_prime_seats(
             client, token,
@@ -585,51 +583,38 @@ async def process_sessions(
         if current is None:
             continue
 
-        prev = prime_seat_state[session_key]
-        prime_seat_state[session_key] = current
-
-        if prev is None:
-            # 첫 조회: 현재 상태 기록만, 알림 없음
-            print(
-                f"  [{s['date']} {s['time']}] 초기화 — 명당 {len(current)}석 확인",
-                flush=True,
-            )
-            continue
-
-        newly = current - prev
-
         print(
-            f"  [{s['date']} {s['time']}] 명당 {len(current)}석 (새로 열림: {len(newly)}석)",
+            f"  [{s['date']} {s['time']}] 명당 {len(current)}석 예매 가능",
             flush=True,
         )
 
-        if not newly:
+        if not current:
             continue
 
-        seat_str = _format_prime_seats(newly)
+        seat_str = _format_prime_seats(current)
 
         # 토스트용 한 줄 좌석 요약: "G열 19·20번 / H열 22번"
-        by_row_new: dict[str, list] = defaultdict(list)
-        for row, no in newly:
-            by_row_new[row].append(int(no))
+        by_row_c: dict[str, list] = defaultdict(list)
+        for row, no in current:
+            by_row_c[row].append(int(no))
         seat_compact = " / ".join(
             f"{row}열 {'·'.join(str(n) for n in sorted(nums))}번"
-            for row, nums in sorted(by_row_new.items())
+            for row, nums in sorted(by_row_c.items())
         )
 
         toast_title = f"🎯 명당 오픈 — {mov_name}"
         toast_body  = (
             f"📅 {s['date']}  🕐 {s['time']}  |  {s['hall']}\n"
-            f"열린 좌석: {seat_compact}\n"
-            f"💺 현재 명당 {len(current)}석 예매 가능"
+            f"빈 좌석: {seat_compact}\n"
+            f"💺 명당 {len(current)}석 예매 가능"
         )
 
         msg = (
-            f"🎯 <b>CGV IMAX 명당 오픈!</b>\n\n"
+            f"🎯 <b>CGV IMAX 명당!</b>\n\n"
             f"🎬 {mov_name}\n"
             f"📅 {s['date']}  🕐 {s['time']}\n"
             f"🏛 {s['hall']}\n\n"
-            f"✨ <b>새로 열린 명당</b> ({','.join(prime_rows)}열 {seat_min}~{seat_max}번)\n"
+            f"✨ <b>빈 명당</b> ({','.join(prime_rows)}열 {seat_min}~{seat_max}번)\n"
             f"{seat_str}\n\n"
             f"💺 명당 총 {len(current)}석 예매가능\n\n"
             f"🔗 <a href='https://cgv.co.kr/ticket'>바로 예매</a>"
