@@ -42,7 +42,7 @@ TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
 TELEGRAM_PROXY      = os.getenv("TELEGRAM_PROXY", "")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
-CHECK_INTERVAL      = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
+CHECK_INTERVAL      = int(os.getenv("CHECK_INTERVAL_SECONDS", "5"))
 
 CUST_NO      = os.getenv("CUST_NO", "")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "")
