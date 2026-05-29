@@ -20,6 +20,7 @@ import math
 import os
 import sys
 import time
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -30,7 +31,7 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
-TELEGRAM_PROXY     = os.getenv("TELEGRAM_PROXY", "")   # 예) http://127.0.0.1:7890
+TELEGRAM_PROXY     = os.getenv("TELEGRAM_PROXY", "")
 CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
 
 MOV_NO        = os.getenv("MOV_NO", "30001210")
@@ -40,34 +41,25 @@ RTCTL_SCOP_CD = os.getenv("RTCTL_SCOP_CD", "08")
 CUST_NO       = os.getenv("CUST_NO", "")
 WATCH_DATES   = [d.strip() for d in os.getenv("WATCH_DATES", "").split(",") if d.strip()]
 
-# 브라우저 Application 탭 → Cookies → cgv.co.kr → accessToken 값
-ACCESS_TOKEN  = os.getenv("ACCESS_TOKEN", "")
-# 브라우저 DevTools → Network 탭 → CGV API 요청 선택 → Headers → cookie 값 전체 복사
-# cf_clearance, __cf_bm, accessToken 등이 포함되어야 Cloudflare 통과
-CGV_COOKIES   = os.getenv("CGV_COOKIES", "")
+ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "")
+CGV_COOKIES  = os.getenv("CGV_COOKIES", "")
 
-TOKEN_FILE    = Path(__file__).parent / "token.json"
+TOKEN_FILE = Path(__file__).parent / "token.json"
 
-CGV_API_BASE   = "https://api.cgv.co.kr"
-SCHEDULE_PATH  = "/cnm/atkt/searchSchByMov"
-REISSUE_PATH   = "/com/bznsCom/custKeep/reissueToken"
+CGV_API_BASE    = "https://api.cgv.co.kr"
+SCHEDULE_PATH   = "/cnm/atkt/searchSchByMov"
+SEAT_PATH       = "/cnm/atkt/searchIfSeatData"
+REISSUE_PATH    = "/com/bznsCom/custKeep/reissueToken"
 
-# CGV JS bundle(module 74189)에서 추출한 HMAC 서명 비밀키
 _HMAC_SECRET = "ydqXY0ocnFLmJGHr_zNzFcpjwAsXq_8JcBNURAkRscg"
-
-# curl_cffi impersonate 대상 (Chrome 최신 → Cloudflare 통과)
 _IMPERSONATE = "chrome124"
 
 notified_sessions: set = set()
 
 
-# ── 서명 생성 ───────────────────────────────────────────────────────────────
+# ── 서명 / 헤더 ─────────────────────────────────────────────────────────────
 
 def make_signature(path: str, body: str, timestamp: str) -> str:
-    """
-    CGV API x-signature 생성
-    알고리즘: HMAC-SHA256("{timestamp}|{path}|{body}", SECRET) → Base64
-    """
     message = f"{timestamp}|{path}|{body}"
     raw = hmac.new(
         _HMAC_SECRET.encode("utf-8"),
@@ -81,26 +73,24 @@ def current_timestamp() -> str:
     return str(math.floor(time.time()))
 
 
-# ── HTTP 헤더 ────────────────────────────────────────────────────────────────
-
 def make_headers(token: str, path: str, body: str = "") -> dict:
     ts  = current_timestamp()
     sig = make_signature(path, body, ts)
     headers = {
-        "accept":           "application/json",
-        "accept-language":  "ko-KR,ko;q=0.9",
-        "authorization":    f"Bearer {token}",
-        "origin":           "https://cgv.co.kr",
-        "referer":          "https://cgv.co.kr/",
-        "x-timestamp":      ts,
-        "x-signature":      sig,
+        "accept":          "application/json",
+        "accept-language": "ko-KR,ko;q=0.9",
+        "authorization":   f"Bearer {token}",
+        "origin":          "https://cgv.co.kr",
+        "referer":         "https://cgv.co.kr/",
+        "x-timestamp":     ts,
+        "x-signature":     sig,
     }
     if CGV_COOKIES:
         headers["cookie"] = CGV_COOKIES
     return headers
 
 
-# ── 토큰 저장/로드 ─────────────────────────────────────────────────────────
+# ── 토큰 저장/로드/갱신 ───────────────────────────────────────────────────────
 
 def save_token(token: str) -> None:
     TOKEN_FILE.write_text(json.dumps({"accessToken": token}))
@@ -108,7 +98,6 @@ def save_token(token: str) -> None:
 
 
 def load_token() -> str:
-    """저장된 토큰 → 없으면 .env ACCESS_TOKEN 사용"""
     if TOKEN_FILE.exists():
         try:
             t = json.loads(TOKEN_FILE.read_text()).get("accessToken", "")
@@ -119,13 +108,7 @@ def load_token() -> str:
     return ACCESS_TOKEN
 
 
-# ── 토큰 갱신 ─────────────────────────────────────────────────────────────
-
 async def reissue_token(client: AsyncSession, current_token: str) -> str:
-    """
-    CGV 토큰 갱신 (401 / statusCode -1001 발생 시 호출)
-    JS 분석 결과: POST {accessToken} → data.accessToken
-    """
     print("[토큰] 갱신 시도...", flush=True)
     payload = json.dumps({"accessToken": current_token})
     try:
@@ -147,7 +130,6 @@ async def reissue_token(client: AsyncSession, current_token: str) -> str:
         print(f"[토큰] 갱신 실패: {body.get('statusMessage')}", flush=True)
     except Exception as e:
         print(f"[토큰] 갱신 오류: {e}", flush=True)
-
     print("[토큰] .env의 ACCESS_TOKEN을 새로 복사해주세요.", flush=True)
     return current_token
 
@@ -155,7 +137,6 @@ async def reissue_token(client: AsyncSession, current_token: str) -> str:
 # ── Telegram ────────────────────────────────────────────────────────────────
 
 async def send_telegram(message: str) -> None:
-    """curl_cffi 로 Telegram Bot API 직접 호출"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print(f"[텔레그램 미설정] {message}", flush=True)
         return
@@ -175,21 +156,12 @@ async def send_telegram(message: str) -> None:
         print(f"[텔레그램] 전송 실패: {type(e).__name__}: {e}", flush=True)
 
 
-# ── 파싱 ────────────────────────────────────────────────────────────────────
+# ── 스케줄 파싱 ──────────────────────────────────────────────────────────────
 
 _debug_logged: set = set()
 
 
 def parse_schedule(data: list, date: str) -> list:
-    """
-    CGV API 응답 data 배열에서 IMAX 잔여석 세션 추출
-
-    확인된 필드명:
-      frSeatCnt  → 잔여(예매가능)석
-      stcnt      → 총좌석
-      scnsrtTm   → 시작시간 (HHMM)
-      scnsNm     → 상영관명
-    """
     first = date not in _debug_logged
     if first:
         _debug_logged.add(date)
@@ -199,7 +171,6 @@ def parse_schedule(data: list, date: str) -> list:
     available = []
     for s in data:
         hall = s.get("scnsNm") or s.get("expoScnsNm") or ""
-        # IMAX 상영관 필터
         if "imax" not in hall.lower() and "아이맥스" not in hall:
             continue
 
@@ -217,12 +188,108 @@ def parse_schedule(data: list, date: str) -> list:
             "remain":     remain,
             "total":      total,
             "hall":       hall,
+            "scns_no":    s.get("scnsNo", ""),       # 좌석 상세 조회용
             "session_id": s.get("scnSseq") or t,
         })
     return available
 
 
-# ── API 호출 ────────────────────────────────────────────────────────────────
+# ── 좌석 상세 조회 ────────────────────────────────────────────────────────────
+
+async def fetch_seat_detail(
+    client: AsyncSession, token: str,
+    date: str, scns_no: str, scn_sseq: str,
+) -> dict | None:
+    """
+    searchIfSeatData → 구역별 예매가능 좌석 수 반환
+    seatSaleYn == 'Y' 인 좌석이 예매 가능
+    """
+    params = {
+        "coCd":       CO_CD,
+        "siteNo":     SITE_NO,
+        "scnYmd":     date,
+        "scnsNo":     scns_no,
+        "scnSseq":    scn_sseq,
+        "seatAreaNo": "001",
+        "cusgdCd":    "01",
+    }
+    if CUST_NO:
+        params["custNo"] = CUST_NO
+
+    try:
+        resp = await client.get(
+            CGV_API_BASE + SEAT_PATH,
+            params=params,
+            headers=make_headers(token, SEAT_PATH),
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return None
+        body = resp.json()
+        if body.get("statusCode") != 0:
+            return None
+
+        items = (body.get("data") or {}).get("items") or []
+        if not items:
+            return None
+
+        seats = items[0].get("seats", [])
+        avail = [s for s in seats if s.get("seatSaleYn") == "Y"]
+
+        zones = Counter(s.get("szoneNm") or "기타" for s in avail)
+
+        return {
+            "total":    len(seats),
+            "avail":    len(avail),
+            "zones":    dict(zones),          # {"Light존": 120, "Extreme존": 110, ...}
+        }
+    except Exception as e:
+        print(f"[좌석상세] 조회 실패: {e}", flush=True)
+        return None
+
+
+# ── 알림 ─────────────────────────────────────────────────────────────────────
+
+async def process_results(sessions: list, client: AsyncSession, token: str) -> None:
+    for s in sessions:
+        sid = f"{s['date']}_{s['session_id']}_{s['time']}"
+        if sid in notified_sessions:
+            continue
+        notified_sessions.add(sid)
+
+        # 좌석 상세 조회 (scns_no 있을 때만)
+        detail = None
+        if s.get("scns_no"):
+            detail = await fetch_seat_detail(
+                client, token,
+                s["date"], s["scns_no"], str(s["session_id"])
+            )
+            await asyncio.sleep(0.5)  # API 연속 호출 간격
+
+        # 메시지 조합
+        seat_line = f"💺 잔여 {s['remain']}석 / 총 {s['total']}석"
+        zone_lines = ""
+        if detail:
+            seat_line = f"💺 예매가능 {detail['avail']}석 / 총 {detail['total']}석"
+            if detail["zones"]:
+                zone_lines = "\n\n📊 <b>구역별 현황</b>\n" + "\n".join(
+                    f"  · {zone}: {cnt}석"
+                    for zone, cnt in sorted(detail["zones"].items(), key=lambda x: -x[1])
+                )
+
+        msg = (
+            f"🎬 <b>CGV 용산IMAX 오픈!</b>\n\n"
+            f"📅 {s['date']}  🕐 {s['time']}\n"
+            f"🏛 {s['hall']}\n"
+            f"{seat_line}"
+            f"{zone_lines}\n\n"
+            f"🔗 <a href='https://cgv.co.kr/ticket'>바로 예매</a>"
+        )
+        await send_telegram(msg)
+        print(f"  → 알림: {s['date']} {s['time']} 잔여 {s['remain']}석", flush=True)
+
+
+# ── 스케줄 API 호출 ──────────────────────────────────────────────────────────
 
 async def fetch_schedule(client: AsyncSession, token: str, date: str):
     params: dict = {
@@ -234,7 +301,6 @@ async def fetch_schedule(client: AsyncSession, token: str, date: str):
     }
     if CUST_NO:
         params["custNo"] = CUST_NO
-
     return await client.get(
         CGV_API_BASE + SCHEDULE_PATH,
         params=params,
@@ -246,7 +312,6 @@ async def fetch_schedule(client: AsyncSession, token: str, date: str):
 async def check_date(client: AsyncSession, token: str, date: str) -> tuple[list, str]:
     resp = await fetch_schedule(client, token, date)
 
-    # 401: 토큰 만료 → 갱신 후 재시도
     if resp.status_code == 401:
         try:
             body = resp.json()
@@ -279,25 +344,6 @@ async def check_date(client: AsyncSession, token: str, date: str) -> tuple[list,
 
     print(f"[{date}] 전체 {len(data)}개 세션 (IMAX 필터 전)", flush=True)
     return parse_schedule(data, date), token
-
-
-# ── 알림 ─────────────────────────────────────────────────────────────────────
-
-async def process_results(sessions: list) -> None:
-    for s in sessions:
-        sid = f"{s['date']}_{s['session_id']}_{s['time']}"
-        if sid in notified_sessions:
-            continue
-        notified_sessions.add(sid)
-        msg = (
-            f"🎬 <b>CGV 용산IMAX 오픈!</b>\n\n"
-            f"📅 {s['date']}  🕐 {s['time']}\n"
-            f"🏛 {s['hall']}\n"
-            f"💺 잔여 {s['remain']}석 / 총 {s['total']}석\n\n"
-            f"🔗 <a href='https://cgv.co.kr/ticket'>바로 예매</a>"
-        )
-        await send_telegram(msg)
-        print(f"  → 알림: {s['date']} {s['time']} 잔여 {s['remain']}석", flush=True)
 
 
 # ── 메인 ─────────────────────────────────────────────────────────────────────
@@ -347,7 +393,7 @@ async def main():
                 try:
                     sessions, token = await check_date(client, token, date)
                     if sessions:
-                        await process_results(sessions)
+                        await process_results(sessions, client, token)
                     else:
                         print(f"  [{date}] IMAX 예매 없음", flush=True)
                 except Exception as e:
