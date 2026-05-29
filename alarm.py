@@ -18,7 +18,10 @@ import hmac
 import json
 import math
 import os
+import platform
+import re
 import sys
+import threading
 import time
 from collections import Counter
 from datetime import datetime
@@ -182,11 +185,55 @@ async def send_discord(message: str) -> None:
         print(f"[디스코드] 전송 실패: {type(e).__name__}: {e}", flush=True)
 
 
+async def send_windows_alert(message: str) -> None:
+    """Windows 전용: 경고음 + 토스트 알림 (네트워크 불필요)"""
+    if platform.system() != "Windows":
+        return
+
+    plain = re.sub(r"<[^>]+>", "", message).strip()
+
+    # 경고음 (winsound 내장 모듈)
+    try:
+        import winsound
+        loop = asyncio.get_event_loop()
+        for _ in range(5):
+            await loop.run_in_executor(
+                None, winsound.Beep, 1000, 300  # 1000Hz, 300ms
+            )
+            await asyncio.sleep(0.2)
+    except Exception as e:
+        print(f"[윈도우] 경고음 실패: {e}", flush=True)
+
+    # 토스트 알림 (win11toast 설치 시)
+    try:
+        from win11toast import toast_async
+        await toast_async("🎬 CGV 용산IMAX 오픈!", plain[:120])
+        print("[윈도우] 토스트 알림 전송", flush=True)
+        return
+    except ImportError:
+        pass  # win11toast 없으면 팝업으로 대체
+    except Exception as e:
+        print(f"[윈도우] 토스트 실패: {e}", flush=True)
+
+    # 팝업 대체 (win11toast 없을 때, 비동기 처리)
+    try:
+        import ctypes
+        threading.Thread(
+            target=ctypes.windll.user32.MessageBoxW,
+            args=(0, plain[:300], "🎬 CGV 용산IMAX 오픈!", 0x30 | 0x1000),
+            daemon=True,
+        ).start()
+        print("[윈도우] 팝업 알림 표시", flush=True)
+    except Exception as e:
+        print(f"[윈도우] 팝업 실패: {e}", flush=True)
+
+
 async def notify(message: str) -> None:
     """설정된 모든 채널로 알림 전송"""
     await asyncio.gather(
-        send_telegram(message),
-        send_discord(message),
+        # send_telegram(message),   # 사내망 차단 - 비활성화
+        # send_discord(message),    # 사내망 차단 - 비활성화
+        send_windows_alert(message),
     )
 
 
@@ -405,8 +452,14 @@ async def main():
         print(f"  텔레그램 봇: ...{TELEGRAM_BOT_TOKEN[-6:]}")
         if TELEGRAM_PROXY:
             print(f"  텔레그램 프록시: {TELEGRAM_PROXY}")
+    if platform.system() == "Windows":
+        try:
+            import win11toast  # noqa: F401
+            print("  윈도우 알림: 토스트 + 경고음")
+        except ImportError:
+            print("  윈도우 알림: 팝업 + 경고음  (토스트 원하면: pip install win11toast)")
     if not DISCORD_WEBHOOK_URL and not TELEGRAM_BOT_TOKEN:
-        print("  알림: 미설정 (콘솔 출력만)")
+        print("  외부 알림: 미설정")
     print("=" * 60)
 
     ts  = current_timestamp()
