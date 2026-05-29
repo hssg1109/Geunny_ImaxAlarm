@@ -1,15 +1,19 @@
 """
 CGV IMAX 좌석 오픈 알리미
 
-[인증 방식]
-- accessToken: 브라우저 쿠키 'accessToken' 에 저장
+[흐름]
+1. 날짜 입력
+2. searchMovScnInfo → IMAX 영화 목록 표시
+3. 영화 선택 → 해당 영화 상영 시간 목록 표시
+4. 시간 선택 → 명당 조건 확인
+5. 명당 좌석이 새로 열릴 때마다 Windows 알림
+
+[인증]
+- accessToken: 브라우저 쿠키 'accessToken'
 - x-signature: HMAC-SHA256("{timestamp}|{path}|{body}", SECRET_KEY) → Base64
 
 [Cloudflare 우회]
-- curl_cffi 로 Chrome TLS 핑거프린트 흉내
-
-[명당 알림 조건]
-- 사용자 지정 열/번호 중 빈 좌석이 새로 생겼을 때만 알림
+- curl_cffi Chrome TLS 핑거프린트
 """
 
 import asyncio
@@ -33,7 +37,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── 환경변수 (알림/인증 관련만) ───────────────────────────────────────────────
+# ── 환경변수 ─────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
 TELEGRAM_PROXY      = os.getenv("TELEGRAM_PROXY", "")
@@ -48,42 +52,36 @@ TOKEN_FILE  = Path(__file__).parent / "token.json"
 CONFIG_FILE = Path(__file__).parent / "config.json"
 
 CGV_API_BASE  = "https://api.cgv.co.kr"
-SCHEDULE_PATH = "/cnm/atkt/searchSchByMov"
-SEAT_PATH     = "/cnm/atkt/searchIfSeatData"
+MOV_SCN_PATH  = "/cnm/atkt/searchMovScnInfo"   # 날짜별 전체 상영 목록
+SCHEDULE_PATH = "/cnm/atkt/searchSchByMov"      # 영화별 상영 목록 (감시 루프용)
+SEAT_PATH     = "/cnm/atkt/searchIfSeatData"    # 좌석 상세
 REISSUE_PATH  = "/com/bznsCom/custKeep/reissueToken"
 
 _HMAC_SECRET = "ydqXY0ocnFLmJGHr_zNzFcpjwAsXq_8JcBNURAkRscg"
 _IMPERSONATE = "chrome124"
 
-# 명당 조건 (설정에서 덮어씀)
-PRIME_ROWS     = {"F", "G", "H", "I", "J"}
-PRIME_SEAT_MIN = 17
-PRIME_SEAT_MAX = 28
-
-prime_seat_state: dict[str, set | None] = defaultdict(lambda: None)
-
-
-# ── config.json 관리 ─────────────────────────────────────────────────────────
-
 DEFAULT_CONFIG = {
-    "mov_no":       "30001210",
-    "mov_name":     "미션 임파서블 8",
-    "site_no":      "0013",
-    "co_cd":        "A420",
-    "rtctl_scop_cd":"08",
-    "watch_dates":  [],           # ["20260531", "20260601"]
-    "watch_times":  [],           # ["08:00", "11:00"] — 비어있으면 전체
-    "prime_rows":   ["F","G","H","I","J"],
+    "mov_no":         "30001210",
+    "mov_name":       "미션 임파서블 8",
+    "site_no":        "0013",
+    "co_cd":          "A420",
+    "rtctl_scop_cd":  "08",
+    "watch_dates":    [],
+    "watch_times":    [],
+    "prime_rows":     ["F", "G", "H", "I", "J"],
     "prime_seat_min": 17,
     "prime_seat_max": 28,
 }
 
+prime_seat_state: dict[str, set | None] = defaultdict(lambda: None)
+
+
+# ── config.json ───────────────────────────────────────────────────────────────
 
 def load_config() -> dict:
     if CONFIG_FILE.exists():
         try:
             cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            # 누락된 키는 기본값으로 채움
             for k, v in DEFAULT_CONFIG.items():
                 cfg.setdefault(k, v)
             return cfg
@@ -96,90 +94,7 @@ def save_config(cfg: dict) -> None:
     CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-# ── 대화형 설정 마법사 ────────────────────────────────────────────────────────
-
-def _input(prompt: str, default: str = "") -> str:
-    """입력 받기. Enter만 치면 default 반환"""
-    if default:
-        val = input(f"{prompt} [{default}]: ").strip()
-        return val if val else default
-    return input(f"{prompt}: ").strip()
-
-
-def setup_wizard(cfg: dict) -> dict:
-    print("\n" + "─" * 50)
-    print("  설정 마법사")
-    print("─" * 50)
-
-    # ── 영화 ──────────────────────────────────────────
-    print("\n[ 1 ] 영화")
-    print("  CGV 예매 페이지 URL에서 movNo= 값을 확인하세요")
-    print("  예) cgv.co.kr/ticket?movNo=30001210")
-    mov_no   = _input("  영화 번호 (movNo)", cfg["mov_no"])
-    mov_name = _input("  영화 이름 (표시용)", cfg["mov_name"])
-
-    # ── 날짜 ──────────────────────────────────────────
-    print("\n[ 2 ] 감시 날짜")
-    print("  YYYYMMDD 형식, 쉼표로 구분")
-    print("  예) 20260531,20260601,20260602")
-    default_dates = ",".join(cfg["watch_dates"])
-    dates_str = _input("  날짜", default_dates)
-    watch_dates = [d.strip() for d in dates_str.split(",") if d.strip()]
-
-    # ── 시간 ──────────────────────────────────────────
-    print("\n[ 3 ] 원하는 상영 시간")
-    print("  HH:MM 형식, 쉼표로 구분 / 전체 감시는 Enter")
-    print("  예) 08:00,11:00,14:00")
-    default_times = ",".join(cfg["watch_times"])
-    times_str = _input("  시간 (전체면 Enter)", default_times)
-    watch_times = [t.strip() for t in times_str.split(",") if t.strip()]
-
-    # ── 명당 좌석 ──────────────────────────────────────
-    print("\n[ 4 ] 명당 좌석 조건")
-    default_rows = ",".join(sorted(cfg["prime_rows"]))
-    rows_str = _input("  감시할 열 (예: F,G,H,I,J)", default_rows)
-    prime_rows = [r.strip().upper() for r in rows_str.split(",") if r.strip()]
-
-    seat_min = _input("  시작 번호", str(cfg["prime_seat_min"]))
-    seat_max = _input("  끝 번호",   str(cfg["prime_seat_max"]))
-
-    cfg.update({
-        "mov_no":         mov_no,
-        "mov_name":       mov_name,
-        "watch_dates":    watch_dates,
-        "watch_times":    watch_times,
-        "prime_rows":     prime_rows,
-        "prime_seat_min": int(seat_min),
-        "prime_seat_max": int(seat_max),
-    })
-
-    save_config(cfg)
-    print("\n  설정이 저장되었습니다. (config.json)")
-    return cfg
-
-
-def confirm_or_setup(cfg: dict) -> dict:
-    """저장된 설정을 보여주고 그대로 쓸지 재설정할지 선택"""
-    print("\n" + "=" * 60)
-    print("  CGV IMAX 좌석 오픈 알리미")
-    print("=" * 60)
-    print(f"\n현재 설정:")
-    print(f"  영화    : {cfg['mov_name']} ({cfg['mov_no']})")
-    dates_disp = ", ".join(cfg["watch_dates"]) if cfg["watch_dates"] else "(없음)"
-    times_disp = ", ".join(cfg["watch_times"]) if cfg["watch_times"] else "전체"
-    rows_disp  = ", ".join(sorted(cfg["prime_rows"]))
-    print(f"  날짜    : {dates_disp}")
-    print(f"  시간    : {times_disp}")
-    print(f"  명당 조건: {rows_disp}열  {cfg['prime_seat_min']}~{cfg['prime_seat_max']}번")
-
-    print("\n[Enter] 시작  /  [c] 설정 변경: ", end="", flush=True)
-    choice = input().strip().lower()
-    if choice == "c":
-        cfg = setup_wizard(cfg)
-    return cfg
-
-
-# ── 서명 / 헤더 ─────────────────────────────────────────────────────────────
+# ── 서명 / 헤더 ──────────────────────────────────────────────────────────────
 
 def make_signature(path: str, body: str, timestamp: str) -> str:
     message = f"{timestamp}|{path}|{body}"
@@ -336,13 +251,210 @@ async def notify(message: str) -> None:
     )
 
 
-# ── 스케줄 파싱 ──────────────────────────────────────────────────────────────
+# ── searchMovScnInfo: 날짜별 전체 상영 목록 ──────────────────────────────────
+
+async def fetch_movie_list(
+    client: AsyncSession, token: str, date: str, cfg: dict
+) -> tuple[list | None, str]:
+    params: dict = {
+        "coCd":        cfg.get("co_cd", "A420"),
+        "siteNo":      cfg.get("site_no", "0013"),
+        "scnYmd":      date,
+        "rtctlScopCd": cfg.get("rtctl_scop_cd", "08"),
+    }
+    if CUST_NO:
+        params["custNo"] = CUST_NO
+
+    resp = await client.get(
+        CGV_API_BASE + MOV_SCN_PATH,
+        params=params,
+        headers=make_headers(token, MOV_SCN_PATH),
+        timeout=15,
+    )
+
+    if resp.status_code == 401:
+        token = await reissue_token(client, token)
+        resp = await client.get(
+            CGV_API_BASE + MOV_SCN_PATH,
+            params=params,
+            headers=make_headers(token, MOV_SCN_PATH),
+            timeout=15,
+        )
+
+    if resp.status_code != 200:
+        cf = resp.headers.get("cf-ray", "")
+        print(f"[상영목록] HTTP {resp.status_code}  cf-ray={cf}", flush=True)
+        return None, token
+
+    body = resp.json()
+    if body.get("statusCode") != 0:
+        print(f"[상영목록] API 오류: {body.get('statusMessage', '')}", flush=True)
+        return None, token
+
+    data = body.get("data")
+    return (data if isinstance(data, list) else None), token
+
+
+def _is_imax_hall(hall: str) -> bool:
+    return "imax" in hall.lower() or "아이맥스" in hall
+
+
+def parse_imax_movies(sessions_flat: list) -> list:
+    """
+    평면 세션 리스트에서 IMAX 세션만 추출하고 영화별로 그룹핑.
+    반환: [{movNo, movNm, movEnm, sessions: [{date, time, hall, scns_no, session_id, total, fr_seat}]}]
+    """
+    movies: dict[str, dict] = {}
+
+    for s in sessions_flat:
+        hall = s.get("scnsNm") or s.get("expoScnsNm") or ""
+        if not _is_imax_hall(hall):
+            continue
+
+        mov_no = s.get("movNo", "")
+        if not mov_no:
+            continue
+
+        if mov_no not in movies:
+            movies[mov_no] = {
+                "movNo":  mov_no,
+                "movNm":  s.get("movNm") or s.get("expoProdNm") or mov_no,
+                "movEnm": s.get("movEnm") or s.get("engProdNm") or "",
+                "sessions": [],
+            }
+
+        t = s.get("scnsrtTm") or "????"
+        time_fmt = f"{t[:2]}:{t[2:]}" if len(t) == 4 else t
+
+        movies[mov_no]["sessions"].append({
+            "date":       s.get("scnYmd", ""),
+            "time":       time_fmt,
+            "hall":       hall,
+            "scns_no":    s.get("scnsNo", ""),
+            "session_id": s.get("scnSseq", ""),
+            "total":      int(s.get("stcnt") or 0),
+            "fr_seat":    int(s.get("frSeatCnt") or 0),
+        })
+
+    for m in movies.values():
+        m["sessions"].sort(key=lambda x: x["time"])
+
+    return sorted(movies.values(), key=lambda x: x["movNm"])
+
+
+# ── 대화형 설정: 날짜 → 영화 선택 → 시간 선택 → 명당 조건 ─────────────────
+
+def _input(prompt: str, default: str = "") -> str:
+    if default:
+        val = input(f"{prompt} [{default}]: ").strip()
+        return val if val else default
+    return input(f"{prompt}: ").strip()
+
+
+async def interactive_setup(
+    client: AsyncSession, token: str, cfg: dict
+) -> tuple[dict, str]:
+    print("\n" + "=" * 60)
+    print("  CGV IMAX 좌석 오픈 알리미")
+    print("=" * 60)
+
+    # ── Step 1: 감시 날짜 ────────────────────────────────────────
+    print("\n[ 1 ] 날짜 입력")
+    print("  YYYYMMDD 형식, 쉼표로 구분")
+    print("  예) 20260531,20260601")
+    saved_dates = ",".join(cfg.get("watch_dates") or [])
+    while True:
+        dates_str = _input("  날짜", saved_dates)
+        dates = [d.strip() for d in dates_str.split(",") if re.fullmatch(r"\d{8}", d.strip())]
+        if dates:
+            break
+        print("  YYYYMMDD 형식으로 입력해주세요.")
+
+    ref_date = dates[0]
+
+    # ── Step 2: IMAX 영화 목록 조회 ──────────────────────────────
+    print(f"\n  [{ref_date}] 상영 목록 조회 중...", flush=True)
+    sessions_flat, token = await fetch_movie_list(client, token, ref_date, cfg)
+
+    if sessions_flat is None:
+        print("  상영 목록 조회 실패. ACCESS_TOKEN을 확인하세요.")
+        sys.exit(1)
+
+    imax_movies = parse_imax_movies(sessions_flat)
+    if not imax_movies:
+        print(f"  {ref_date}에 IMAX 상영 영화가 없습니다.")
+        sys.exit(1)
+
+    # ── Step 3: 영화 선택 ────────────────────────────────────────
+    print(f"\n[ 2 ] IMAX 영화 목록 ({ref_date})")
+    for i, m in enumerate(imax_movies, 1):
+        cnt = len(m["sessions"])
+        enm = f"  ({m['movEnm']})" if m["movEnm"] else ""
+        print(f"  [{i}] {m['movNm']}{enm}  — {cnt}회차")
+
+    while True:
+        raw = input("\n  영화 번호 선택: ").strip()
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(imax_movies):
+                break
+        except ValueError:
+            pass
+        print("  올바른 번호를 입력하세요.")
+
+    selected = imax_movies[idx]
+    cfg["mov_no"]   = selected["movNo"]
+    cfg["mov_name"] = selected["movNm"]
+
+    # ── Step 4: 상영 시간 선택 ───────────────────────────────────
+    sessions = selected["sessions"]
+    print(f"\n[ 3 ] {selected['movNm']} — 상영 시간")
+    for i, s in enumerate(sessions, 1):
+        print(f"  [{i}] {s['time']}  {s['hall']}  (잔여 {s['fr_seat']}석 / 총 {s['total']}석)")
+    print(f"  [전체] 모든 시간 감시")
+
+    raw_times = input("\n  시간 번호 선택 (쉼표로 구분, 전체면 Enter): ").strip()
+    if raw_times:
+        watch_times = []
+        for t in raw_times.split(","):
+            try:
+                ti = int(t.strip()) - 1
+                if 0 <= ti < len(sessions):
+                    tm = sessions[ti]["time"]
+                    if tm not in watch_times:
+                        watch_times.append(tm)
+            except ValueError:
+                pass
+    else:
+        watch_times = []
+
+    cfg["watch_dates"] = dates
+    cfg["watch_times"] = watch_times
+
+    # ── Step 5: 명당 조건 확인 ───────────────────────────────────
+    rows_disp = ",".join(sorted(cfg["prime_rows"]))
+    print(f"\n[ 4 ] 명당 좌석 조건")
+    print(f"  현재: {rows_disp}열  {cfg['prime_seat_min']}~{cfg['prime_seat_max']}번")
+    change = input("  변경하려면 [c], 그대로면 Enter: ").strip().lower()
+    if change == "c":
+        rows_str = _input("  감시할 열 (예: F,G,H,I,J)", rows_disp)
+        cfg["prime_rows"] = [r.strip().upper() for r in rows_str.split(",") if r.strip()]
+        seat_min = _input("  시작 번호", str(cfg["prime_seat_min"]))
+        seat_max = _input("  끝 번호",   str(cfg["prime_seat_max"]))
+        cfg["prime_seat_min"] = int(seat_min)
+        cfg["prime_seat_max"] = int(seat_max)
+
+    save_config(cfg)
+    print("\n  설정 저장 완료 (config.json)")
+    return cfg, token
+
+
+# ── 스케줄 파싱 (searchSchByMov 응답용) ──────────────────────────────────────
 
 _debug_logged: set = set()
 
 
 def parse_schedule(data: list, date: str, cfg: dict) -> list:
-    """IMAX 세션 반환. watch_times 설정 시 해당 시간만 필터."""
     first = date not in _debug_logged
     if first:
         _debug_logged.add(date)
@@ -353,7 +465,7 @@ def parse_schedule(data: list, date: str, cfg: dict) -> list:
     sessions = []
     for s in data:
         hall = s.get("scnsNm") or s.get("expoScnsNm") or ""
-        if "imax" not in hall.lower() and "아이맥스" not in hall:
+        if not _is_imax_hall(hall):
             continue
 
         t = s.get("scnsrtTm") or s.get("rlMovStartTm") or "?"
@@ -376,9 +488,9 @@ def parse_schedule(data: list, date: str, cfg: dict) -> list:
 # ── 좌석 상세 조회 + 명당 필터 ───────────────────────────────────────────────
 
 def _is_prime(row: str, seat_no_str: str, cfg: dict) -> bool:
-    prime_rows = set(cfg.get("prime_rows") or PRIME_ROWS)
-    seat_min   = cfg.get("prime_seat_min", PRIME_SEAT_MIN)
-    seat_max   = cfg.get("prime_seat_max", PRIME_SEAT_MAX)
+    prime_rows = set(cfg.get("prime_rows") or [])
+    seat_min   = cfg.get("prime_seat_min", 17)
+    seat_max   = cfg.get("prime_seat_max", 28)
     try:
         return row in prime_rows and seat_min <= int(seat_no_str) <= seat_max
     except (ValueError, TypeError):
@@ -440,10 +552,12 @@ def _format_prime_seats(seats: set) -> str:
     )
 
 
-async def process_sessions(sessions: list, client: AsyncSession, token: str, cfg: dict) -> None:
-    prime_rows = sorted(cfg.get("prime_rows") or PRIME_ROWS)
-    seat_min   = cfg.get("prime_seat_min", PRIME_SEAT_MIN)
-    seat_max   = cfg.get("prime_seat_max", PRIME_SEAT_MAX)
+async def process_sessions(
+    sessions: list, client: AsyncSession, token: str, cfg: dict
+) -> None:
+    prime_rows = sorted(cfg.get("prime_rows") or [])
+    seat_min   = cfg.get("prime_seat_min", 17)
+    seat_max   = cfg.get("prime_seat_max", 28)
     mov_name   = cfg.get("mov_name", "")
 
     for s in sessions:
@@ -461,8 +575,8 @@ async def process_sessions(sessions: list, client: AsyncSession, token: str, cfg
         if current is None:
             continue
 
-        prev    = prime_seat_state[session_key]
-        newly   = current if prev is None else (current - prev)
+        prev  = prime_seat_state[session_key]
+        newly = current if prev is None else (current - prev)
         prime_seat_state[session_key] = current
 
         print(
@@ -488,9 +602,11 @@ async def process_sessions(sessions: list, client: AsyncSession, token: str, cfg
         print(f"  → 명당 알림: {s['date']} {s['time']}", flush=True)
 
 
-# ── 스케줄 API 호출 ──────────────────────────────────────────────────────────
+# ── searchSchByMov: 감시 루프용 스케줄 조회 ──────────────────────────────────
 
-async def fetch_schedule(client: AsyncSession, token: str, date: str, cfg: dict):
+async def fetch_schedule(
+    client: AsyncSession, token: str, date: str, cfg: dict
+):
     params: dict = {
         "coCd":        cfg.get("co_cd", "A420"),
         "siteNo":      cfg.get("site_no", "0013"),
@@ -508,7 +624,9 @@ async def fetch_schedule(client: AsyncSession, token: str, date: str, cfg: dict)
     )
 
 
-async def check_date(client: AsyncSession, token: str, date: str, cfg: dict) -> tuple[list, str]:
+async def check_date(
+    client: AsyncSession, token: str, date: str, cfg: dict
+) -> tuple[list, str]:
     resp = await fetch_schedule(client, token, date, cfg)
 
     if resp.status_code == 401:
@@ -521,19 +639,18 @@ async def check_date(client: AsyncSession, token: str, date: str, cfg: dict) -> 
             pass
 
     if resp.status_code != 200:
-        try:
-            body_text = resp.text[:400]
-        except Exception:
-            body_text = ""
         cf_ray = resp.headers.get("cf-ray", "")
         server = resp.headers.get("server", "")
         print(f"[{date}] HTTP {resp.status_code}  server={server}  cf-ray={cf_ray}", flush=True)
-        print(f"[{date}] 응답: {body_text}", flush=True)
+        try:
+            print(f"[{date}] 응답: {resp.text[:300]}", flush=True)
+        except Exception:
+            pass
         return [], token
 
     body = resp.json()
     if body.get("statusCode") != 0:
-        print(f"[{date}] API 오류: {body.get('statusMessage','')}", flush=True)
+        print(f"[{date}] API 오류: {body.get('statusMessage', '')}", flush=True)
         return [], token
 
     data = body.get("data") or []
@@ -548,45 +665,41 @@ async def check_date(client: AsyncSession, token: str, date: str, cfg: dict) -> 
 # ── 메인 ─────────────────────────────────────────────────────────────────────
 
 async def main():
-    # 설정 로드 → 확인/변경
-    cfg = load_config()
-    cfg = confirm_or_setup(cfg)
-
-    if not cfg["watch_dates"]:
-        print("\n오류: 날짜를 설정해주세요. [c]로 재설정 후 실행하세요.")
-        sys.exit(1)
-
     token = load_token()
     if not token:
         print("오류: .env에 ACCESS_TOKEN 설정 필요")
         sys.exit(1)
 
-    rows_disp  = ", ".join(sorted(cfg["prime_rows"]))
-    times_disp = ", ".join(cfg["watch_times"]) if cfg["watch_times"] else "전체"
-
-    print("\n" + "=" * 60)
-    print(f"  영화    : {cfg['mov_name']} ({cfg['mov_no']})")
-    print(f"  날짜    : {', '.join(cfg['watch_dates'])}")
-    print(f"  시간    : {times_disp}")
-    print(f"  명당 조건: {rows_disp}열  {cfg['prime_seat_min']}~{cfg['prime_seat_max']}번")
-    print(f"  확인 주기: {CHECK_INTERVAL}초")
-    if platform.system() == "Windows":
-        try:
-            import win11toast  # noqa: F401
-            print("  윈도우 알림: 토스트 + 경고음")
-        except ImportError:
-            print("  윈도우 알림: 팝업 + 경고음")
-    print("=" * 60)
-
-    await notify(
-        f"🔔 CGV IMAX 알리미 시작\n"
-        f"🎬 {cfg['mov_name']}\n"
-        f"📅 날짜: {', '.join(cfg['watch_dates'])}\n"
-        f"🕐 시간: {times_disp}\n"
-        f"🎯 명당: {rows_disp}열 {cfg['prime_seat_min']}~{cfg['prime_seat_max']}번"
-    )
+    cfg = load_config()
 
     async with AsyncSession(impersonate=_IMPERSONATE) as client:
+        cfg, token = await interactive_setup(client, token, cfg)
+
+        rows_disp  = ", ".join(sorted(cfg["prime_rows"]))
+        times_disp = ", ".join(cfg["watch_times"]) if cfg["watch_times"] else "전체"
+
+        print("\n" + "=" * 60)
+        print(f"  영화    : {cfg['mov_name']} ({cfg['mov_no']})")
+        print(f"  날짜    : {', '.join(cfg['watch_dates'])}")
+        print(f"  시간    : {times_disp}")
+        print(f"  명당 조건: {rows_disp}열  {cfg['prime_seat_min']}~{cfg['prime_seat_max']}번")
+        print(f"  확인 주기: {CHECK_INTERVAL}초")
+        if platform.system() == "Windows":
+            try:
+                import win11toast  # noqa: F401
+                print("  윈도우 알림: 토스트 + 경고음")
+            except ImportError:
+                print("  윈도우 알림: 팝업 + 경고음")
+        print("=" * 60)
+
+        await notify(
+            f"🔔 CGV IMAX 알리미 시작\n"
+            f"🎬 {cfg['mov_name']}\n"
+            f"📅 날짜: {', '.join(cfg['watch_dates'])}\n"
+            f"🕐 시간: {times_disp}\n"
+            f"🎯 명당: {rows_disp}열 {cfg['prime_seat_min']}~{cfg['prime_seat_max']}번"
+        )
+
         round_num = 0
         while True:
             round_num += 1
