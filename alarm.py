@@ -42,7 +42,7 @@ TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
 TELEGRAM_PROXY      = os.getenv("TELEGRAM_PROXY", "")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
-CHECK_INTERVAL      = int(os.getenv("CHECK_INTERVAL_SECONDS", "5"))
+CHECK_INTERVAL      = int(os.getenv("CHECK_INTERVAL_SECONDS", "3"))
 
 CUST_NO      = os.getenv("CUST_NO", "")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "")
@@ -255,7 +255,7 @@ async def notify(
 ) -> None:
     await asyncio.gather(
         # send_telegram(message),   # 사내망 차단 - 비활성화
-        # send_discord(message),    # 사내망 차단 - 비활성화
+        send_discord(message),
         send_windows_alert(message, toast_title, toast_body),
     )
 
