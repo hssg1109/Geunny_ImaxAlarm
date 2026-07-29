@@ -255,7 +255,7 @@ async def notify(
 ) -> None:
     await asyncio.gather(
         # send_telegram(message),   # 사내망 차단 - 비활성화
-        send_discord(message),
+        # send_discord(message),    # 사내망 차단 - 비활성화 (EC2 서버에서는 주석 해제)
         send_windows_alert(message, toast_title, toast_body),
     )
 
@@ -415,27 +415,54 @@ async def interactive_setup(
     cfg["mov_no"]   = selected["movNo"]
     cfg["mov_name"] = selected["movNm"]
 
-    # ── Step 4: 상영 시간 선택 ───────────────────────────────────
-    sessions = selected["sessions"]
-    print(f"\n[ 3 ] {selected['movNm']} — 상영 시간")
-    for i, s in enumerate(sessions, 1):
-        print(f"  [{i}] {s['time']}  {s['hall']}  (잔여 {s['fr_seat']}석 / 총 {s['total']}석)")
-    print(f"  [전체] 모든 시간 감시")
+    # ── Step 4: 날짜별 상영 시간 선택 ──────────────────────────────
+    mov_no = cfg["mov_no"]
+    watch_times: dict[str, list] = {}
 
-    raw_times = input("\n  시간 번호 선택 (쉼표로 구분, 전체면 Enter): ").strip()
-    if raw_times:
-        watch_times = []
-        for t in raw_times.split(","):
-            try:
-                ti = int(t.strip()) - 1
-                if 0 <= ti < len(sessions):
-                    tm = sessions[ti]["time"]
-                    if tm not in watch_times:
-                        watch_times.append(tm)
-            except ValueError:
-                pass
-    else:
-        watch_times = []
+    print(f"\n[ 3 ] {selected['movNm']} — 날짜별 상영 시간 선택")
+
+    for date in dates:
+        # 첫 번째 날짜는 이미 조회한 결과 재사용
+        if date == ref_date:
+            flat = sessions_flat
+        else:
+            print(f"\n  [{date}] 상영 목록 조회 중...", flush=True)
+            flat, token = await fetch_movie_list(client, token, date, cfg)
+            if flat is None:
+                print(f"  [{date}] 조회 실패 — 전체 시간 감시")
+                watch_times[date] = []
+                continue
+
+        imax_for_date = parse_imax_movies(flat)
+        mov_sessions = next(
+            (m["sessions"] for m in imax_for_date if m["movNo"] == mov_no), []
+        )
+
+        if not mov_sessions:
+            print(f"\n  [{date}] 해당 영화 IMAX 상영 없음 — 건너뜀")
+            watch_times[date] = []
+            continue
+
+        print(f"\n  [{date}] 상영 시간:")
+        for i, s in enumerate(mov_sessions, 1):
+            print(f"    [{i}] {s['time']}  {s['hall']}  (잔여 {s['fr_seat']}석 / 총 {s['total']}석)")
+        print(f"    [전체] 모든 시간 감시")
+
+        raw_times = input(f"\n  [{date}] 시간 선택 (번호, 쉼표로 구분 / 전체면 Enter): ").strip()
+        if raw_times:
+            selected_times = []
+            for t in raw_times.split(","):
+                try:
+                    ti = int(t.strip()) - 1
+                    if 0 <= ti < len(mov_sessions):
+                        tm = mov_sessions[ti]["time"]
+                        if tm not in selected_times:
+                            selected_times.append(tm)
+                except ValueError:
+                    pass
+            watch_times[date] = selected_times
+        else:
+            watch_times[date] = []
 
     cfg["watch_dates"] = dates
     cfg["watch_times"] = watch_times
@@ -470,7 +497,12 @@ def parse_schedule(data: list, date: str, cfg: dict) -> list:
         if data:
             print(f"[{date}] DEBUG 첫 필드: {list(data[0].keys())[:12]}", flush=True)
 
-    watch_times: set = set(cfg.get("watch_times") or [])
+    wt = cfg.get("watch_times") or {}
+    # dict: {date: [times]} 또는 구버전 list 모두 지원
+    if isinstance(wt, dict):
+        watch_times: set = set(wt.get(date) or [])
+    else:
+        watch_times = set(wt)
     sessions = []
     for s in data:
         hall = s.get("scnsNm") or s.get("expoScnsNm") or ""
@@ -696,13 +728,15 @@ async def main():
     async with AsyncSession(impersonate=_IMPERSONATE) as client:
         cfg, token = await interactive_setup(client, token, cfg)
 
-        rows_disp  = ", ".join(sorted(cfg["prime_rows"]))
-        times_disp = ", ".join(cfg["watch_times"]) if cfg["watch_times"] else "전체"
+        rows_disp = ", ".join(sorted(cfg["prime_rows"]))
+        wt = cfg.get("watch_times") or {}
 
         print("\n" + "=" * 60)
         print(f"  영화    : {cfg['mov_name']} ({cfg['mov_no']})")
-        print(f"  날짜    : {', '.join(cfg['watch_dates'])}")
-        print(f"  시간    : {times_disp}")
+        for d in cfg["watch_dates"]:
+            times = wt.get(d) if isinstance(wt, dict) else None
+            times_disp = ", ".join(times) if times else "전체"
+            print(f"  날짜    : {d}  ({times_disp})")
         print(f"  명당 조건: {rows_disp}열  {cfg['prime_seat_min']}~{cfg['prime_seat_max']}번")
         print(f"  확인 주기: {CHECK_INTERVAL}초")
         if platform.system() == "Windows":
@@ -713,11 +747,14 @@ async def main():
                 print("  윈도우 알림: 팝업 + 경고음")
         print("=" * 60)
 
+        dates_summary = "\n".join(
+            f"  {d}: {', '.join(wt.get(d)) if isinstance(wt, dict) and wt.get(d) else '전체'}"
+            for d in cfg["watch_dates"]
+        )
         await notify(
             f"🔔 CGV IMAX 알리미 시작\n"
             f"🎬 {cfg['mov_name']}\n"
-            f"📅 날짜: {', '.join(cfg['watch_dates'])}\n"
-            f"🕐 시간: {times_disp}\n"
+            f"📅 감시 날짜/시간:\n{dates_summary}\n"
             f"🎯 명당: {rows_disp}열 {cfg['prime_seat_min']}~{cfg['prime_seat_max']}번"
         )
 
