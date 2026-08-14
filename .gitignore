@@ -2,6 +2,7 @@
 cgv_session.json
 config.json
 token.json
+movie_state.json
 __pycache__/
 *.pyc
 *.pyo
