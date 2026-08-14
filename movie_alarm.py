@@ -28,7 +28,7 @@ TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
 TELEGRAM_PROXY      = os.getenv("TELEGRAM_PROXY", "")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
-CHECK_INTERVAL      = int(os.getenv("NEW_MOVIE_CHECK_INTERVAL_SECONDS", "5"))
+CHECK_INTERVAL      = int(os.getenv("NEW_MOVIE_CHECK_INTERVAL_SECONDS", "60"))
 
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "")
 CGV_COOKIES  = os.getenv("CGV_COOKIES", "")
@@ -295,6 +295,17 @@ async def fetch_movie_list(
             timeout=15,
         )
 
+    if resp.status_code == 429:
+        wait = 30
+        print(f"[{date}] 429 레이트 리밋 — {wait}초 대기 후 재시도", flush=True)
+        await asyncio.sleep(wait)
+        resp = await client.get(
+            CGV_API_BASE + MOV_SCN_PATH,
+            params=params,
+            headers=make_headers(token, MOV_SCN_PATH),
+            timeout=15,
+        )
+
     if resp.status_code != 200:
         print(f"[{date}] HTTP {resp.status_code}  cf-ray={resp.headers.get('cf-ray','')}", flush=True)
         return None, token
@@ -378,7 +389,7 @@ async def main():
                     continue
                 sessions = parse_imax_sessions(flat)
                 current_all.update(sessions)
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(1.5)
 
             print(f"  전체 IMAX 세션: {len(current_all)}개", flush=True)
 
