@@ -50,6 +50,11 @@ SITE_NO       = "0013"
 RTCTL_SCOP_CD = "08"
 
 WATCH_DAYS = 20  # 오늘부터 감시할 일수
+RATE_LIMIT_WAIT = 90  # 429 발생 시 대기 시간(초)
+
+
+class RateLimitError(Exception):
+    pass
 
 
 # ── 날짜 목록 생성 ────────────────────────────────────────────────────────────
@@ -296,15 +301,7 @@ async def fetch_movie_list(
         )
 
     if resp.status_code == 429:
-        wait = 30
-        print(f"[{date}] 429 레이트 리밋 — {wait}초 대기 후 재시도", flush=True)
-        await asyncio.sleep(wait)
-        resp = await client.get(
-            CGV_API_BASE + MOV_SCN_PATH,
-            params=params,
-            headers=make_headers(token, MOV_SCN_PATH),
-            timeout=15,
-        )
+        raise RateLimitError(date)
 
     if resp.status_code != 200:
         print(f"[{date}] HTTP {resp.status_code}  cf-ray={resp.headers.get('cf-ray','')}", flush=True)
@@ -380,9 +377,16 @@ async def main():
 
             dates = get_date_range(WATCH_DAYS)
             current_all: dict[str, dict] = {}
+            rate_limited = False
 
             for date in dates:
-                flat, token = await fetch_movie_list(client, token, date)
+                try:
+                    flat, token = await fetch_movie_list(client, token, date)
+                except RateLimitError:
+                    print(f"  429 레이트 리밋 — 라운드 중단, {RATE_LIMIT_WAIT}초 대기 후 재시작", flush=True)
+                    await asyncio.sleep(RATE_LIMIT_WAIT)
+                    rate_limited = True
+                    break
                 if flat is None:
                     print(f"  [{date}] 조회 실패", flush=True)
                     await asyncio.sleep(1)
@@ -390,6 +394,9 @@ async def main():
                 sessions = parse_imax_sessions(flat)
                 current_all.update(sessions)
                 await asyncio.sleep(1.5)
+
+            if rate_limited:
+                continue
 
             print(f"  전체 IMAX 세션: {len(current_all)}개", flush=True)
 
