@@ -3,6 +3,7 @@ cgv_session.json
 config.json
 token.json
 movie_state.json
+interval_tune.json
 __pycache__/
 *.pyc
 *.pyo

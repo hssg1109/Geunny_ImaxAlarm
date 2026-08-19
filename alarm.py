@@ -31,6 +31,7 @@ import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 from curl_cffi.requests import AsyncSession
 from dotenv import load_dotenv
@@ -59,6 +60,8 @@ REISSUE_PATH  = "/com/bznsCom/custKeep/reissueToken"
 
 _HMAC_SECRET = "ydqXY0ocnFLmJGHr_zNzFcpjwAsXq_8JcBNURAkRscg"
 _IMPERSONATE = "chrome124"
+
+PAGES_BASE_URL = "https://hssg1109.github.io/Geunny_ImaxAlarm"  # cgv:// 리다이렉트 페이지 (GitHub Pages)
 
 DEFAULT_CONFIG = {
     "mov_no":         "30001210",
@@ -255,7 +258,7 @@ async def notify(
 ) -> None:
     await asyncio.gather(
         # send_telegram(message),   # 사내망 차단 - 비활성화
-        # send_discord(message),    # 사내망 차단 - 비활성화 (EC2 서버에서는 주석 해제)
+        send_discord(message),
         send_windows_alert(message, toast_title, toast_body),
     )
 
@@ -581,6 +584,54 @@ async def fetch_prime_seats(
         return None
 
 
+async def fetch_seat_summary(
+    client: AsyncSession, token: str,
+    date: str, scns_no: str, scn_sseq: str,
+    cfg: dict,
+) -> dict | None:
+    """정시 상태체크용: 전체 잔여석 + 명당 잔여석 요약"""
+    params = {
+        "coCd":       cfg.get("co_cd", "A420"),
+        "siteNo":     cfg.get("site_no", "0013"),
+        "scnYmd":     date,
+        "scnsNo":     scns_no,
+        "scnSseq":    scn_sseq,
+        "seatAreaNo": "001",
+        "cusgdCd":    "01",
+    }
+    if CUST_NO:
+        params["custNo"] = CUST_NO
+    try:
+        resp = await client.get(
+            CGV_API_BASE + SEAT_PATH,
+            params=params,
+            headers=make_headers(token, SEAT_PATH),
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return None
+        body = resp.json()
+        if body.get("statusCode") != 0:
+            return None
+        items = (body.get("data") or {}).get("items") or []
+        if not items:
+            return None
+        seats = items[0].get("seats", [])
+        available = [s for s in seats if s.get("seatSaleYn") == "Y"]
+        prime_available = [
+            s for s in available
+            if _is_prime(s.get("seatRowNm", ""), s.get("seatNo", ""), cfg)
+        ]
+        return {
+            "total": len(seats),
+            "available": len(available),
+            "prime_available": len(prime_available),
+        }
+    except Exception as e:
+        print(f"[좌석요약] 조회 실패: {e}", flush=True)
+        return None
+
+
 # ── 명당 감지 + 알림 ─────────────────────────────────────────────────────────
 
 def _format_prime_seats(seats: set) -> str:
@@ -641,6 +692,18 @@ async def process_sessions(
             f"💺 명당 {len(current)}석 예매 가능"
         )
 
+        site_no = cfg.get("site_no", "0013")
+        mov_no  = cfg.get("mov_no", "")
+        web_url = (
+            f"https://cgv.co.kr/cnm/movieBook/cinema?siteNo={site_no}"
+            f"&siteNm={quote('용산아이파크몰')}"
+            f"&scnYmd={s['date']}&movNo={mov_no}"
+        )
+        app_url = (
+            f"{PAGES_BASE_URL}/cgv/?d={s['date']}&site={site_no}"
+            f"&siteNm={quote('용산아이파크몰')}&movNo={mov_no}"
+        )
+
         msg = (
             f"🎯 <b>CGV IMAX 명당!</b>\n\n"
             f"🎬 {mov_name}\n"
@@ -649,7 +712,8 @@ async def process_sessions(
             f"✨ <b>빈 명당</b> ({','.join(prime_rows)}열 {seat_min}~{seat_max}번)\n"
             f"{seat_str}\n\n"
             f"💺 명당 총 {len(current)}석 예매가능\n\n"
-            f"🔗 <a href='https://cgv.co.kr/ticket'>바로 예매</a>"
+            f"📱 <a href='{app_url}'>CGV 앱 열기</a>\n"
+            f"🔗 <a href='{web_url}'>웹으로 예매</a>"
         )
         await notify(msg, toast_title=toast_title, toast_body=toast_body)
         print(f"  → 명당 알림: {s['date']} {s['time']}", flush=True)
@@ -715,6 +779,38 @@ async def check_date(
     return sessions, token
 
 
+# ── 정시 상태체크 (07:00~24:00, 1시간마다) ────────────────────────────────────
+
+async def send_hourly_status(client: AsyncSession, token: str, cfg: dict) -> str:
+    mov_name = cfg.get("mov_name", "")
+    lines = []
+
+    for date in cfg["watch_dates"]:
+        sessions, token = await check_date(client, token, date, cfg)
+        for s in sessions:
+            if not s.get("scns_no"):
+                continue
+            summary = await fetch_seat_summary(
+                client, token, s["date"], s["scns_no"], str(s["session_id"]), cfg
+            )
+            await asyncio.sleep(0.5)
+            if summary is None:
+                lines.append(f"  {s['date']} {s['time']} — 조회 실패")
+                continue
+            lines.append(
+                f"  {s['date']} {s['time']} — 잔여 {summary['available']}/{summary['total']}석"
+                f" (명당 {summary['prime_available']}석)"
+            )
+
+    now_str = datetime.now().strftime("%H:%M")
+    body = "\n".join(lines) if lines else "  감시 대상 회차 없음"
+    print(f"\n[정시 상태체크 {now_str}]\n{body}", flush=True)
+
+    msg = f"📊 <b>[정시 상태체크 {now_str}]</b>\n🎬 {mov_name}\n{body}"
+    await send_discord(msg)
+    return token
+
+
 # ── 메인 ─────────────────────────────────────────────────────────────────────
 
 async def main():
@@ -759,9 +855,11 @@ async def main():
         )
 
         round_num = 0
+        last_status_hour = None
         while True:
             round_num += 1
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            now_dt = datetime.now()
+            now = now_dt.strftime("%Y-%m-%d %H:%M:%S")
             print(f"\n[{now}] 라운드 {round_num}", flush=True)
 
             for date in cfg["watch_dates"]:
@@ -774,6 +872,13 @@ async def main():
                 except Exception as e:
                     print(f"  [{date}] 오류: {e}", flush=True)
                 await asyncio.sleep(1)
+
+            if 7 <= now_dt.hour <= 23 and now_dt.hour != last_status_hour:
+                try:
+                    token = await send_hourly_status(client, token, cfg)
+                except Exception as e:
+                    print(f"[정시 상태체크] 오류: {e}", flush=True)
+                last_status_hour = now_dt.hour
 
             print(f"[대기] {CHECK_INTERVAL}초 후 재확인...", flush=True)
             await asyncio.sleep(CHECK_INTERVAL)

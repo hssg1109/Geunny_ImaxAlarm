@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>CGV 앱 열기</title>
+<style>
+  :root { color-scheme: light dark; --bg:#faf9f7; --fg:#1a1a1a; --sub:#6b6b6b; --line:#e3e0da; --accent:#e2211c; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#141416; --fg:#f2f2f2; --sub:#a0a0a0; --line:#2e2e32; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin:0; min-height:100dvh; background:var(--bg); color:var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Pretendard", sans-serif;
+    display:flex; align-items:center; justify-content:center; padding:24px;
+    word-break: keep-all; overflow-wrap: break-word;
+  }
+  .card { width:100%; max-width:420px; text-align:center; }
+  .date { font-size:2.6rem; font-weight:800; letter-spacing:-0.02em; margin:0 0 4px; }
+  .place { font-size:1rem; color:var(--sub); margin:0 0 28px; }
+  .hint { font-size:.9rem; color:var(--sub); margin:0 0 20px; line-height:1.6; }
+  a.btn {
+    display:block; padding:18px 20px; border-radius:14px; text-decoration:none;
+    font-size:1.05rem; font-weight:700; margin-bottom:12px;
+  }
+  .primary { background:var(--accent); color:#fff; }
+  .secondary { background:transparent; color:var(--fg); border:1.5px solid var(--line); }
+  .foot { margin-top:24px; font-size:.8rem; color:var(--sub); line-height:1.6; }
+</style>
+</head>
+<body>
+<div class="card">
+  <p class="date" id="date">CGV</p>
+  <p class="place" id="place">앱을 여는 중…</p>
+  <p class="hint" id="hint">앱이 자동으로 열리지 않으면 아래를 눌러 주세요.</p>
+
+  <a class="btn primary" id="app" href="cgv://">📱 CGV 앱 열기</a>
+  <a class="btn secondary" id="web" href="https://cgv.co.kr/">🌐 웹으로 예매하기</a>
+
+  <p class="foot" id="foot">앱에는 로그인과 결제수단이 이미 들어 있습니다.<br>날짜는 앱에서 직접 선택해 주세요.</p>
+</div>
+
+<script>
+(function () {
+  var q = new URLSearchParams(location.search);
+  var d = (q.get('d') || '').replace(/\D/g, '');       // YYYYMMDD
+  var site = (q.get('site') || '0013').replace(/\D/g, '');
+  var siteNm = q.get('siteNm') || '용산아이파크몰';
+  var movNo = (q.get('movNo') || '').replace(/\D/g, '');
+
+  if (d.length === 8) {
+    var y = +d.slice(0, 4), m = +d.slice(4, 6), day = +d.slice(6, 8);
+    var wd = '일월화수목금토'[new Date(y, m - 1, day).getDay()];
+    document.getElementById('date').textContent = m + '월 ' + day + '일 (' + wd + ')';
+    document.getElementById('place').textContent = siteNm;
+    var webUrl = 'https://cgv.co.kr/cnm/movieBook/cinema?siteNo=' + encodeURIComponent(site) +
+      '&siteNm=' + encodeURIComponent(siteNm) + '&scnYmd=' + d;
+    if (movNo) webUrl += '&movNo=' + encodeURIComponent(movNo);
+    document.getElementById('web').href = webUrl;
+  } else {
+    document.getElementById('place').textContent = '앱을 여는 중…';
+  }
+
+  // 자동 실행. iOS가 사용자 제스처를 요구해 막는 경우가 있어 버튼을 항상 남겨둔다.
+  setTimeout(function () { location.href = 'cgv://'; }, 60);
+})();
+</script>
+</body>
+</html>

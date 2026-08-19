@@ -13,10 +13,12 @@ import json
 import math
 import os
 import platform
+import re
 import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import quote
 
 from curl_cffi.requests import AsyncSession
 from dotenv import load_dotenv
@@ -36,6 +38,7 @@ CUST_NO      = os.getenv("CUST_NO", "")
 
 TOKEN_FILE  = Path(__file__).parent / "token.json"
 STATE_FILE  = Path(__file__).parent / "movie_state.json"
+INTERVAL_STATE_FILE = Path(__file__).parent / "interval_tune.json"
 
 CGV_API_BASE  = "https://api.cgv.co.kr"
 MOV_SCN_PATH  = "/cnm/atkt/searchMovScnInfo"
@@ -44,6 +47,8 @@ REISSUE_PATH  = "/com/bznsCom/custKeep/reissueToken"
 _HMAC_SECRET = "ydqXY0ocnFLmJGHr_zNzFcpjwAsXq_8JcBNURAkRscg"
 _IMPERSONATE = "chrome124"
 
+PAGES_BASE_URL = "https://hssg1109.github.io/Geunny_ImaxAlarm"  # cgv:// 리다이렉트 페이지 (GitHub Pages)
+
 # 용산아이파크몰 CGV 고정값
 CO_CD         = "A420"
 SITE_NO       = "0013"
@@ -51,6 +56,13 @@ RTCTL_SCOP_CD = "08"
 
 WATCH_DAYS = 20  # 오늘부터 감시할 일수
 RATE_LIMIT_WAIT = 90  # 429 발생 시 대기 시간(초)
+
+# ── 적응형 인터벌 튜닝 ─────────────────────────────────────────────────────────
+MIN_CHECK_INTERVAL = 20          # 안전 하한(초)
+MAX_CHECK_INTERVAL = 180         # 안전 상한(초)
+DECREASE_STEP = 5                # 안정적일 때 줄이는 폭(초)
+SAFETY_MARGIN = 10               # 최적값 찾은 후 얹는 여유분(초)
+STABLE_ROUNDS_TO_DECREASE = 20   # 이만큼 연속 무사고면 인터벌 축소 시도
 
 
 class RateLimitError(Exception):
@@ -77,6 +89,24 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_interval_state() -> dict:
+    if INTERVAL_STATE_FILE.exists():
+        try:
+            return json.loads(INTERVAL_STATE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {
+        "interval": CHECK_INTERVAL,
+        "last_known_good": CHECK_INTERVAL,
+        "consecutive_ok": 0,
+        "locked": False,
+    }
+
+
+def save_interval_state(state: dict) -> None:
+    INTERVAL_STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # ── 서명 / 헤더 ──────────────────────────────────────────────────────────────
@@ -168,6 +198,22 @@ async def send_telegram(message: str) -> None:
         print(f"[텔레그램] 전송 실패: {e}", flush=True)
 
 
+async def send_discord(message: str) -> None:
+    if not DISCORD_WEBHOOK_URL:
+        return
+    text = re.sub(r"<a href='([^']+)'>([^<]+)</a>", r"[\2](\1)",
+           message.replace("<b>", "**").replace("</b>", "**"))
+    try:
+        async with AsyncSession(impersonate=_IMPERSONATE) as s:
+            resp = await s.post(DISCORD_WEBHOOK_URL, json={"content": text}, timeout=10)
+        if resp.status_code in (200, 204):
+            print("[디스코드] 전송 완료", flush=True)
+        else:
+            print(f"[디스코드] 전송 실패: HTTP {resp.status_code}", flush=True)
+    except Exception as e:
+        print(f"[디스코드] 전송 실패: {type(e).__name__}: {e}", flush=True)
+
+
 async def send_windows_alert(title: str, body: str) -> None:
     if platform.system() != "Windows":
         return
@@ -213,8 +259,10 @@ async def notify_initial_status(current_all: dict) -> None:
 
     if not by_movie:
         toast_body = f"오늘({today}) IMAX 상영 없음\n신규 오픈 감시 중..."
+        msg = f"🎬 <b>IMAX 알리미 시작</b>\n\n{toast_body}"
         await asyncio.gather(
-            # send_telegram(...)  # 사내망 차단 - 비활성화
+            send_discord(msg),
+            # send_telegram(msg),  # 사내망 차단 - 비활성화
             send_windows_alert("🎬 IMAX 알리미 시작", toast_body),
         )
         return
@@ -228,9 +276,11 @@ async def notify_initial_status(current_all: dict) -> None:
         )
         toast_lines.append(f"{mov_nm}\n{times}")
     toast_body = "\n\n".join(toast_lines)
+    msg = f"🎬 <b>IMAX 현황 — 오늘 {today} ({dow})</b>\n\n{toast_body}"
 
     await asyncio.gather(
-        # send_telegram(msg)  # 사내망 차단 - 비활성화
+        send_discord(msg),
+        # send_telegram(msg),  # 사내망 차단 - 비활성화
         send_windows_alert(f"🎬 IMAX 현황 — 오늘 {today} ({dow})", toast_body),
     )
 
@@ -248,11 +298,24 @@ async def notify_new_movie(mov_nm: str, new_sessions: list) -> None:
         )
 
     sessions_text = "\n".join(lines)
+    mov_no  = new_sessions[0].get("movNo", "")
+    first_date = sorted(new_sessions, key=lambda x: (x["date"], x["time"]))[0]["date"]
+    web_url = (
+        f"https://cgv.co.kr/cnm/movieBook/cinema?siteNo={SITE_NO}"
+        f"&siteNm={quote('용산아이파크몰')}"
+        f"&scnYmd={first_date}&movNo={mov_no}"
+    )
+    app_url = (
+        f"{PAGES_BASE_URL}/cgv/?d={first_date}&site={SITE_NO}"
+        f"&siteNm={quote('용산아이파크몰')}&movNo={mov_no}"
+    )
     msg = (
         f"🎬 <b>IMAX 신규 오픈!</b>\n\n"
         f"<b>{mov_nm}</b>\n"
         f"🏛 CGV 용산아이파크몰 IMAX\n\n"
-        f"{sessions_text}"
+        f"{sessions_text}\n\n"
+        f"📱 <a href='{app_url}'>CGV 앱 열기</a>\n"
+        f"🔗 <a href='{web_url}'>웹으로 예매</a>"
     )
 
     # 토스트용 요약
@@ -265,9 +328,25 @@ async def notify_new_movie(mov_nm: str, new_sessions: list) -> None:
     )
 
     await asyncio.gather(
+        send_discord(msg),
         # send_telegram(msg),  # 사내망 차단 - 비활성화
         send_windows_alert(f"🎬 IMAX 신규 오픈 — {mov_nm}", toast_body),
     )
+
+
+async def notify_hourly_status(current_all: dict) -> None:
+    """정시 상태체크: 현재 감시 범위 내 IMAX 오픈 영화 목록 (출력 + 디스코드만)"""
+    movie_names = sorted({info["movNm"] for info in current_all.values()})
+    now_str = datetime.now().strftime("%H:%M")
+
+    body = "\n".join(f"  - {m}" for m in movie_names) if movie_names else "  없음"
+    print(f"\n[정시 상태체크 {now_str}] IMAX 상영중 영화 {len(movie_names)}개:\n{body}", flush=True)
+
+    msg = (
+        f"📊 <b>[정시 상태체크 {now_str}]</b>\n"
+        f"🏛 CGV 용산아이파크몰 IMAX 상영중 영화 ({len(movie_names)}개)\n\n{body}"
+    )
+    await send_discord(msg)
 
 
 # ── 상영 목록 조회 ────────────────────────────────────────────────────────────
@@ -361,18 +440,28 @@ async def main():
     if STATE_FILE.exists():
         STATE_FILE.unlink()
 
+    ivl = load_interval_state()
+
     print("\n" + "=" * 60)
     print("  CGV 용산아이파크몰 IMAX 신규 영화 알리미")
     print(f"  감시 범위: 오늘 ~ {WATCH_DAYS}일 후")
-    print(f"  확인 주기: {CHECK_INTERVAL}초")
+    if ivl["locked"]:
+        print(f"  확인 주기: {ivl['interval']}초 (적응형 튜닝 완료, 고정됨)")
+    else:
+        print(
+            f"  확인 주기: {ivl['interval']}초 "
+            f"(적응형 튜닝 중, 연속 무사고 {ivl['consecutive_ok']}/{STABLE_ROUNDS_TO_DECREASE})"
+        )
     print("=" * 60)
     print("\n  상태 초기화 완료. 오늘자 현황 알림 후 감시 시작.\n", flush=True)
 
     async with AsyncSession(impersonate=_IMPERSONATE) as client:
         round_num = 0
+        last_status_hour = None
         while True:
             round_num += 1
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            now_dt = datetime.now()
+            now = now_dt.strftime("%Y-%m-%d %H:%M:%S")
             print(f"[{now}] 라운드 {round_num}", flush=True)
 
             dates = get_date_range(WATCH_DAYS)
@@ -396,9 +485,36 @@ async def main():
                 await asyncio.sleep(1.5)
 
             if rate_limited:
+                if not ivl["locked"]:
+                    ivl["interval"] = min(MAX_CHECK_INTERVAL, ivl["last_known_good"] + SAFETY_MARGIN)
+                    ivl["locked"] = True
+                    ivl["consecutive_ok"] = 0
+                    save_interval_state(ivl)
+                    print(
+                        f"  [적응형 인터벌] 최적값 확정 및 고정: {ivl['interval']}초 "
+                        f"(안정 확인값 {ivl['last_known_good']}초 + 안전마진 {SAFETY_MARGIN}초)",
+                        flush=True,
+                    )
                 continue
 
+            # 라운드 무사고 완료 — 튜닝 중이면 인터벌 축소 시도
+            if not ivl["locked"]:
+                ivl["consecutive_ok"] += 1
+                if ivl["consecutive_ok"] >= STABLE_ROUNDS_TO_DECREASE:
+                    ivl["last_known_good"] = ivl["interval"]
+                    ivl["interval"] = max(MIN_CHECK_INTERVAL, ivl["interval"] - DECREASE_STEP)
+                    ivl["consecutive_ok"] = 0
+                    print(f"  [적응형 인터벌] {STABLE_ROUNDS_TO_DECREASE}라운드 무사고 — {ivl['interval']}초로 축소 시도", flush=True)
+                save_interval_state(ivl)
+
             print(f"  전체 IMAX 세션: {len(current_all)}개", flush=True)
+
+            if 7 <= now_dt.hour <= 23 and now_dt.hour != last_status_hour:
+                try:
+                    await notify_hourly_status(current_all)
+                except Exception as e:
+                    print(f"[정시 상태체크] 오류: {e}", flush=True)
+                last_status_hour = now_dt.hour
 
             if not state:
                 # 첫 라운드: 오늘 현황 알림 후 상태 기록
@@ -431,8 +547,8 @@ async def main():
                 else:
                     print("  신규 오픈 없음", flush=True)
 
-            print(f"[대기] {CHECK_INTERVAL}초 후 재확인...\n", flush=True)
-            await asyncio.sleep(CHECK_INTERVAL)
+            print(f"[대기] {ivl['interval']}초 후 재확인...\n", flush=True)
+            await asyncio.sleep(ivl["interval"])
 
 
 if __name__ == "__main__":
