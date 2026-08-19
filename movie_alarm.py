@@ -527,15 +527,15 @@ async def main():
                 new_keys = set(current_all.keys()) - set(state.keys())
 
                 if new_keys:
-                    # 영화별로 그룹핑
-                    by_movie: dict[str, list] = {}
+                    # 영화+날짜별로 그룹핑 (같은 영화라도 날짜가 다르면 알림 분리)
+                    by_movie_date: dict[tuple[str, str], list] = {}
                     for key in new_keys:
                         info = current_all[key]
-                        mov_nm = info["movNm"]
-                        by_movie.setdefault(mov_nm, []).append(info)
+                        group_key = (info["movNm"], info["date"])
+                        by_movie_date.setdefault(group_key, []).append(info)
 
-                    for mov_nm, sessions in by_movie.items():
-                        print(f"  🎬 신규 오픈: {mov_nm} ({len(sessions)}회차)", flush=True)
+                    for (mov_nm, date), sessions in sorted(by_movie_date.items()):
+                        print(f"  🎬 신규 오픈: {mov_nm} {date} ({len(sessions)}회차)", flush=True)
                         for s in sessions:
                             print(f"    {s['date']} {s['time']}  잔여 {s['fr_seat']}석", flush=True)
                         await notify_new_movie(mov_nm, sessions)
