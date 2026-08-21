@@ -258,7 +258,7 @@ async def notify(
 ) -> None:
     await asyncio.gather(
         # send_telegram(message),   # 사내망 차단 - 비활성화
-        send_discord(message),
+        # send_discord(message),    # 사내망 차단 - 비활성화
         send_windows_alert(message, toast_title, toast_body),
     )
 
@@ -506,6 +506,10 @@ def parse_schedule(data: list, date: str, cfg: dict) -> list:
         watch_times: set = set(wt.get(date) or [])
     else:
         watch_times = set(wt)
+
+    now = datetime.now()
+    today_str = now.strftime("%Y%m%d")
+
     sessions = []
     for s in data:
         hall = s.get("scnsNm") or s.get("expoScnsNm") or ""
@@ -517,6 +521,12 @@ def parse_schedule(data: list, date: str, cfg: dict) -> list:
 
         if watch_times and time_fmt not in watch_times:
             continue
+
+        # 상영 시작 시간이 이미 지난 세션 제외
+        if date == today_str and len(t) == 4:
+            show_dt = now.replace(hour=int(t[:2]), minute=int(t[2:]), second=0, microsecond=0)
+            if now >= show_dt:
+                continue
 
         sessions.append({
             "date":       date,
@@ -807,7 +817,7 @@ async def send_hourly_status(client: AsyncSession, token: str, cfg: dict) -> str
     print(f"\n[정시 상태체크 {now_str}]\n{body}", flush=True)
 
     msg = f"📊 <b>[정시 상태체크 {now_str}]</b>\n🎬 {mov_name}\n{body}"
-    await send_discord(msg)
+    # await send_discord(msg)   # 사내망 차단 - 비활성화
     return token
 
 
