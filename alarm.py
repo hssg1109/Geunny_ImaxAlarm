@@ -524,9 +524,12 @@ def parse_schedule(data: list, date: str, cfg: dict) -> list:
 
         # 상영 시작 시간이 이미 지난 세션 제외
         if date == today_str and len(t) == 4:
-            show_dt = now.replace(hour=int(t[:2]), minute=int(t[2:]), second=0, microsecond=0)
-            if now >= show_dt:
-                continue
+            try:
+                show_dt = now.replace(hour=int(t[:2]), minute=int(t[2:]), second=0, microsecond=0)
+                if now >= show_dt:
+                    continue
+            except ValueError:
+                pass  # 비정상 시간값(예: 2400)은 필터링하지 않고 통과
 
         sessions.append({
             "date":       date,
