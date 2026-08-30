@@ -43,14 +43,27 @@ TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
 TELEGRAM_PROXY      = os.getenv("TELEGRAM_PROXY", "")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
-CHECK_INTERVAL      = int(os.getenv("CHECK_INTERVAL_SECONDS", "3"))
+CHECK_INTERVAL      = int(os.getenv("CHECK_INTERVAL_SECONDS", "1"))
 
 CUST_NO      = os.getenv("CUST_NO", "")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "")
 CGV_COOKIES  = os.getenv("CGV_COOKIES", "")
 
-TOKEN_FILE  = Path(__file__).parent / "token.json"
-CONFIG_FILE = Path(__file__).parent / "config.json"
+TOKEN_FILE          = Path(__file__).parent / "token.json"
+CONFIG_FILE         = Path(__file__).parent / "config.json"
+INTERVAL_STATE_FILE = Path(__file__).parent / "alarm_interval_tune.json"
+
+# ── 적응형 인터벌 튜닝 (429 발생 시 원복) ─────────────────────────────────────
+RATE_LIMIT_WAIT           = 90  # 429 발생 시 대기 시간(초)
+MIN_CHECK_INTERVAL        = 1   # 목표 하한(초) — 최대한 이 값까지 줄여본다
+MAX_CHECK_INTERVAL        = 30  # 안전 상한(초)
+DECREASE_STEP             = 1   # 안정적일 때 줄이는 폭(초)
+SAFETY_MARGIN             = 1   # 429 이후 확정값에 얹는 여유분(초)
+STABLE_ROUNDS_TO_DECREASE = 20  # 이만큼 연속 무사고면 인터벌 축소 시도
+
+
+class RateLimitError(Exception):
+    pass
 
 CGV_API_BASE  = "https://api.cgv.co.kr"
 MOV_SCN_PATH  = "/cnm/atkt/searchMovScnInfo"   # 날짜별 전체 상영 목록
@@ -59,7 +72,7 @@ SEAT_PATH     = "/cnm/atkt/searchIfSeatData"    # 좌석 상세
 REISSUE_PATH  = "/com/bznsCom/custKeep/reissueToken"
 
 _HMAC_SECRET = "ydqXY0ocnFLmJGHr_zNzFcpjwAsXq_8JcBNURAkRscg"
-_IMPERSONATE = "chrome124"
+_IMPERSONATE = "chrome146"
 
 PAGES_BASE_URL = "https://hssg1109.github.io/Geunny_ImaxAlarm"  # cgv:// 리다이렉트 페이지 (GitHub Pages)
 
@@ -74,6 +87,8 @@ DEFAULT_CONFIG = {
     "prime_rows":     ["F", "G", "H", "I", "J", "K", "L"],
     "prime_seat_min": 17,
     "prime_seat_max": 28,
+    "auto_book":        False,  # True면 2연석 감지 시 browser_booking.py(Playwright)로 자동예매 시도
+    "auto_book_armed":  True,   # 자동예매 1회 성공 시 False로 바뀜 (중복예매 방지)
 }
 
 
@@ -94,6 +109,24 @@ def load_config() -> dict:
 
 def save_config(cfg: dict) -> None:
     CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_interval_state() -> dict:
+    if INTERVAL_STATE_FILE.exists():
+        try:
+            return json.loads(INTERVAL_STATE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {
+        "interval": CHECK_INTERVAL,
+        "last_known_good": CHECK_INTERVAL,
+        "consecutive_ok": 0,
+        "locked": False,
+    }
+
+
+def save_interval_state(state: dict) -> None:
+    INTERVAL_STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # ── 서명 / 헤더 ──────────────────────────────────────────────────────────────
@@ -577,6 +610,8 @@ async def fetch_prime_seats(
             headers=make_headers(token, SEAT_PATH),
             timeout=15,
         )
+        if resp.status_code == 429:
+            raise RateLimitError(date)
         if resp.status_code != 200:
             return None
         body = resp.json()
@@ -592,6 +627,8 @@ async def fetch_prime_seats(
             if s.get("seatSaleYn") == "Y"
             and _is_prime(s.get("seatRowNm", ""), s.get("seatNo", ""), cfg)
         }
+    except RateLimitError:
+        raise
     except Exception as e:
         print(f"[좌석상세] 조회 실패: {e}", flush=True)
         return None
@@ -657,6 +694,29 @@ def _format_prime_seats(seats: set) -> str:
     )
 
 
+def find_seat_pairs(seats: set) -> list[tuple[str, int, int]]:
+    """같은 열에서 좌석번호가 연속인(n, n+1) 2연석 쌍을 모두 찾는다."""
+    by_row: dict[str, list[int]] = defaultdict(list)
+    for row, no in seats:
+        try:
+            by_row[row].append(int(no))
+        except (TypeError, ValueError):
+            continue
+
+    pairs: list[tuple[str, int, int]] = []
+    for row, nums in by_row.items():
+        nums_sorted = sorted(set(nums))
+        for a, b in zip(nums_sorted, nums_sorted[1:]):
+            if b == a + 1:
+                pairs.append((row, a, b))
+    pairs.sort(key=lambda x: (x[0], x[1]))
+    return pairs
+
+
+def _format_pairs(pairs: list[tuple[str, int, int]]) -> str:
+    return " / ".join(f"{row}열 {a}-{b}번" for row, a, b in pairs)
+
+
 async def process_sessions(
     sessions: list, client: AsyncSession, token: str, cfg: dict
 ) -> None:
@@ -674,7 +734,7 @@ async def process_sessions(
             s["date"], s["scns_no"], str(s["session_id"]),
             cfg,
         )
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.15)
 
         if current is None:
             continue
@@ -687,22 +747,20 @@ async def process_sessions(
         if not current:
             continue
 
+        pairs = find_seat_pairs(current)
+        if not pairs:
+            print(f"    → 2연석 없음 (낱개 {len(current)}석뿐) — 알림 생략", flush=True)
+            continue
+
         seat_str = _format_prime_seats(current)
+        pairs_str = _format_pairs(pairs)
 
-        # 토스트용 한 줄 좌석 요약: "G열 19·20번 / H열 22번"
-        by_row_c: dict[str, list] = defaultdict(list)
-        for row, no in current:
-            by_row_c[row].append(int(no))
-        seat_compact = " / ".join(
-            f"{row}열 {'·'.join(str(n) for n in sorted(nums))}번"
-            for row, nums in sorted(by_row_c.items())
-        )
-
-        toast_title = f"🎯 명당 오픈 — {mov_name}"
+        # 토스트용 한 줄 좌석 요약: "G열 19-20번 / H열 25-26번"
+        toast_title = f"🎯 2연석 오픈 — {mov_name}"
         toast_body  = (
             f"📅 {s['date']}  🕐 {s['time']}  |  {s['hall']}\n"
-            f"빈 좌석: {seat_compact}\n"
-            f"💺 명당 {len(current)}석 예매 가능"
+            f"2연석: {pairs_str}\n"
+            f"💺 명당 총 {len(current)}석 예매 가능"
         )
 
         site_no = cfg.get("site_no", "0013")
@@ -718,18 +776,64 @@ async def process_sessions(
         )
 
         msg = (
-            f"🎯 <b>CGV IMAX 명당!</b>\n\n"
+            f"🎯 <b>CGV IMAX 2연석 오픈!</b>\n\n"
             f"🎬 {mov_name}\n"
             f"📅 {s['date']}  🕐 {s['time']}\n"
             f"🏛 {s['hall']}\n\n"
-            f"✨ <b>빈 명당</b> ({','.join(prime_rows)}열 {seat_min}~{seat_max}번)\n"
-            f"{seat_str}\n\n"
+            f"✨ <b>2연석</b> ({','.join(prime_rows)}열 {seat_min}~{seat_max}번)\n"
+            f"  {pairs_str}\n\n"
+            f"✨ <b>빈 명당 전체</b>\n{seat_str}\n\n"
             f"💺 명당 총 {len(current)}석 예매가능\n\n"
             f"📱 <a href='{app_url}'>CGV 앱 열기</a>\n"
             f"🔗 <a href='{web_url}'>웹으로 예매</a>"
         )
+
+        booked = None
+        if cfg.get("auto_book") and cfg.get("auto_book_armed", True):
+            booked = await try_auto_book(client, token, s, cfg, pairs[0])
+
+        if booked:
+            msg = (
+                f"✅ <b>자동예매 완료!</b>\n\n"
+                f"🎬 {mov_name}\n"
+                f"📅 {s['date']}  🕐 {s['time']}\n"
+                f"🏛 {s['hall']}\n"
+                f"💺 좌석: {booked['seat']}\n"
+                f"🎫 예매번호: {booked['mov_atkt_no']}"
+            )
+            toast_title = f"✅ 자동예매 완료 — {mov_name}"
+            toast_body  = f"{s['date']} {s['time']} | {booked['seat']}석"
+
         await notify(msg, toast_title=toast_title, toast_body=toast_body)
         print(f"  → 명당 알림: {s['date']} {s['time']}", flush=True)
+
+
+async def try_auto_book(
+    client: AsyncSession, token: str, session: dict, cfg: dict,
+    pair: tuple[str, int, int],
+) -> dict | None:
+    """
+    2연석 감지 시 browser_booking.py(Playwright)로 자동예매 시도.
+    좌석선점/결제 POST가 curl_cffi에서는 401로 막혀서(Cloudflare가 쓰기성 요청만 엄격히
+    봇 탐지하는 것으로 보임, 원본 test_seat_hold.py도 동일 증상), 실제 예매 실행은
+    Playwright(cgv_session.json 재사용)로 진행한다. 감시 루프 자체는 여전히 curl_cffi라 빠름.
+    성공하면 config.json에 armed=False 저장.
+    """
+    import browser_booking
+
+    try:
+        result = await browser_booking.auto_book(
+            token, session["date"], session["scns_no"], str(session["session_id"]),
+            cfg.get("mov_no", ""), cfg, pair,
+        )
+    except Exception as e:
+        print(f"  [자동예매] 오류: {e}", flush=True)
+        return None
+
+    if result:
+        cfg["auto_book_armed"] = False
+        save_config(cfg)
+    return result
 
 
 # ── searchSchByMov: 감시 루프용 스케줄 조회 ──────────────────────────────────
@@ -758,6 +862,9 @@ async def check_date(
     client: AsyncSession, token: str, date: str, cfg: dict
 ) -> tuple[list, str]:
     resp = await fetch_schedule(client, token, date, cfg)
+
+    if resp.status_code == 429:
+        raise RateLimitError(date)
 
     if resp.status_code == 401:
         try:
@@ -847,7 +954,14 @@ async def main():
             times_disp = ", ".join(times) if times else "전체"
             print(f"  날짜    : {d}  ({times_disp})")
         print(f"  명당 조건: {rows_disp}열  {cfg['prime_seat_min']}~{cfg['prime_seat_max']}번")
-        print(f"  확인 주기: {CHECK_INTERVAL}초")
+        ivl = load_interval_state()
+        if ivl["locked"]:
+            print(f"  확인 주기: {ivl['interval']}초 (429 이후 안전값 고정)")
+        else:
+            print(
+                f"  확인 주기: {ivl['interval']}초 "
+                f"(적응형 튜닝 중, 연속 무사고 {ivl['consecutive_ok']}/{STABLE_ROUNDS_TO_DECREASE})"
+            )
         if platform.system() == "Windows":
             try:
                 import win11toast  # noqa: F401
@@ -875,6 +989,7 @@ async def main():
             now = now_dt.strftime("%Y-%m-%d %H:%M:%S")
             print(f"\n[{now}] 라운드 {round_num}", flush=True)
 
+            rate_limited = False
             for date in cfg["watch_dates"]:
                 try:
                     sessions, token = await check_date(client, token, date, cfg)
@@ -882,9 +997,36 @@ async def main():
                         await process_sessions(sessions, client, token, cfg)
                     else:
                         print(f"  [{date}] 해당 세션 없음", flush=True)
+                except RateLimitError:
+                    print(f"  [{date}] 429 레이트 리밋 — 라운드 중단, {RATE_LIMIT_WAIT}초 대기 후 재시작", flush=True)
+                    await asyncio.sleep(RATE_LIMIT_WAIT)
+                    rate_limited = True
+                    break
                 except Exception as e:
                     print(f"  [{date}] 오류: {e}", flush=True)
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.3)
+
+            if rate_limited:
+                if not ivl["locked"]:
+                    ivl["interval"] = min(MAX_CHECK_INTERVAL, ivl["last_known_good"] + SAFETY_MARGIN)
+                    ivl["locked"] = True
+                    ivl["consecutive_ok"] = 0
+                    save_interval_state(ivl)
+                    print(
+                        f"  [적응형 인터벌] 안전값으로 원복 및 고정: {ivl['interval']}초 "
+                        f"(마지막 안정값 {ivl['last_known_good']}초 + 안전마진 {SAFETY_MARGIN}초)",
+                        flush=True,
+                    )
+                continue
+
+            if not ivl["locked"]:
+                ivl["consecutive_ok"] += 1
+                if ivl["consecutive_ok"] >= STABLE_ROUNDS_TO_DECREASE:
+                    ivl["last_known_good"] = ivl["interval"]
+                    ivl["interval"] = max(MIN_CHECK_INTERVAL, ivl["interval"] - DECREASE_STEP)
+                    ivl["consecutive_ok"] = 0
+                    print(f"  [적응형 인터벌] {STABLE_ROUNDS_TO_DECREASE}라운드 무사고 — {ivl['interval']}초로 축소 시도", flush=True)
+                save_interval_state(ivl)
 
             if 7 <= now_dt.hour <= 23 and now_dt.hour != last_status_hour:
                 try:
@@ -893,11 +1035,19 @@ async def main():
                     print(f"[정시 상태체크] 오류: {e}", flush=True)
                 last_status_hour = now_dt.hour
 
-            print(f"[대기] {CHECK_INTERVAL}초 후 재확인...", flush=True)
-            await asyncio.sleep(CHECK_INTERVAL)
+            print(f"[대기] {ivl['interval']}초 후 재확인...", flush=True)
+            await asyncio.sleep(ivl["interval"])
 
 
 if __name__ == "__main__":
+    # 콘솔 codepage가 cp949 등 UTF-8이 아니면 자동예매 로그의 특수문자(—) 출력에서
+    # UnicodeEncodeError로 죽으면서 취소(롤백) 호출까지 같이 못 하게 되는 사고가 있었다
+    # (2연석 홀드가 안 풀리는 원인). 프로세스 전체 stdout/stderr을 UTF-8로 강제한다.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

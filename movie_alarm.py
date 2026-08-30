@@ -45,7 +45,7 @@ MOV_SCN_PATH  = "/cnm/atkt/searchMovScnInfo"
 REISSUE_PATH  = "/com/bznsCom/custKeep/reissueToken"
 
 _HMAC_SECRET = "ydqXY0ocnFLmJGHr_zNzFcpjwAsXq_8JcBNURAkRscg"
-_IMPERSONATE = "chrome124"
+_IMPERSONATE = "chrome146"
 
 PAGES_BASE_URL = "https://hssg1109.github.io/Geunny_ImaxAlarm"  # cgv:// 리다이렉트 페이지 (GitHub Pages)
 

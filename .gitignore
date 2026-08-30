@@ -1,9 +1,13 @@
 .env
 cgv_session.json
+capture_log.json
+payment_template.json
+debug_*
 config.json
 token.json
 movie_state.json
 interval_tune.json
+alarm_interval_tune.json
 __pycache__/
 *.pyc
 *.pyo

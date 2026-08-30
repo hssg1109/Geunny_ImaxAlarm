@@ -32,7 +32,7 @@ ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "")
 CGV_COOKIES  = os.getenv("CGV_COOKIES", "")
 CUST_NO      = os.getenv("CUST_NO", "")
 
-_IMPERSONATE = "chrome124"
+_IMPERSONATE = "chrome146"
 
 API_BASE      = "https://api.cgv.co.kr"
 SITE_BASE     = "https://cgv.co.kr"
