@@ -52,7 +52,7 @@ from pathlib import Path
 from curl_cffi.requests import AsyncSession
 from dotenv import load_dotenv
 
-from alarm import fetch_schedule, find_seat_pairs, make_headers, DEFAULT_CONFIG
+from alarm import fetch_schedule, find_seat_pairs, rank_seat_pairs, make_headers, DEFAULT_CONFIG
 
 load_dotenv()
 
@@ -171,11 +171,15 @@ def _check_ok(resp, label: str) -> dict:
 async def find_seat_pair(
     client: AsyncSession, date: str, scns_no: str, scn_sseq: str, cfg: dict,
     target_pair: tuple[str, int, int] | None = None,
+    row_priority: list[str] | None = None,
+    center_seats: list[int] | None = None,
 ) -> list[dict] | None:
     """
     searchIfSeatData에서 명당 조건에 맞는 2연석(같은 열, 연속 좌석번호)을 찾는다.
     target_pair=(row, a, b)가 주어지면 그 쌍이 아직 살아있는지 먼저 확인하고,
     없어졌으면(다른 사람이 채감) 같은 조건의 다른 2연석을 새로 찾는다.
+    row_priority가 주어지면(신규 회차 케이스) 대체 탐색도 이 우선순위 순서를 따른다 —
+    없으면 기존처럼 find_seat_pairs()의 기본 순서(열 알파벳순 → 번호순)를 그대로 쓴다.
     """
     params = {
         "coCd": CO_CD, "siteNo": SITE_NO, "scnYmd": date,
@@ -220,7 +224,10 @@ async def find_seat_pair(
             return found
         print(f"[자동예매] 지정된 2연석 {target_pair}이 이미 사라짐 — 다른 2연석 재탐색", flush=True)
 
-    for row, a, b in find_seat_pairs(set(seats_by_key.keys())):
+    candidates = find_seat_pairs(set(seats_by_key.keys()))
+    if row_priority:
+        candidates = rank_seat_pairs(candidates, row_priority, center_seats or [])
+    for row, a, b in candidates:
         found = pair_from(row, a, b)
         if found:
             return found

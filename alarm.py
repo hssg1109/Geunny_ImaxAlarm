@@ -54,12 +54,12 @@ CONFIG_FILE         = Path(__file__).parent / "config.json"
 INTERVAL_STATE_FILE = Path(__file__).parent / "alarm_interval_tune.json"
 
 # ── 적응형 인터벌 튜닝 (429 발생 시 원복) ─────────────────────────────────────
-RATE_LIMIT_WAIT           = 90  # 429 발생 시 대기 시간(초)
-MIN_CHECK_INTERVAL        = 1   # 목표 하한(초) — 최대한 이 값까지 줄여본다
-MAX_CHECK_INTERVAL        = 30  # 안전 상한(초)
-DECREASE_STEP             = 1   # 안정적일 때 줄이는 폭(초)
-SAFETY_MARGIN             = 1   # 429 이후 확정값에 얹는 여유분(초)
-STABLE_ROUNDS_TO_DECREASE = 20  # 이만큼 연속 무사고면 인터벌 축소 시도
+RATE_LIMIT_WAIT           = 90   # 429 발생 시 대기 시간(초)
+MIN_CHECK_INTERVAL        = 0.2  # 목표 하한(초) — 실제 레이트리밋에 걸릴 때까지 이 값까지 줄여본다
+MAX_CHECK_INTERVAL        = 30   # 안전 상한(초)
+DECREASE_STEP             = 0.2  # 안정적일 때 줄이는 폭(초) — 1초 미만 구간도 세밀하게 탐색
+SAFETY_MARGIN             = 0.5  # 429 이후 확정값에 얹는 여유분(초)
+STABLE_ROUNDS_TO_DECREASE = 20   # 이만큼 연속 무사고면 인터벌 축소 시도
 
 
 class RateLimitError(Exception):
@@ -84,6 +84,9 @@ DEFAULT_CONFIG = {
     "rtctl_scop_cd":  "08",
     "watch_dates":    [],
     "watch_times":    [],
+    "watch_new_sessions": {},  # {date: {"mode": "all"} 또는 {"mode": "range", "start": "17:00", "end": "22:00"}}
+    "new_session_row_priority": ["G", "H", "F", "I", "J", "K", "L", "M"],  # 신규 회차 전용 열 우선순위
+    "new_session_center_seats": [22, 23],  # 신규 회차 전용 — 이 좌석번호 중앙에서 가까운 순으로 시도
     "prime_rows":     ["F", "G", "H", "I", "J", "K", "L"],
     "prime_seat_min": 17,
     "prime_seat_max": 28,
@@ -403,6 +406,27 @@ async def interactive_setup(
     print("  CGV IMAX 좌석 오픈 알리미")
     print("=" * 60)
 
+    # ── Step 0: 저장된 설정 재사용 여부 ─────────────────────────────
+    # config.json을 손으로 수정해둔 경우(watch_new_sessions 등) 매번 새로 물어보면서
+    # 덮어쓰지 않도록, 기존 설정이 있으면 그대로 쓸지 먼저 물어본다.
+    if CONFIG_FILE.exists() and cfg.get("mov_no") and cfg.get("watch_dates"):
+        print(f"\n  저장된 설정: {cfg.get('mov_name', '')} ({cfg['mov_no']})")
+        wt_disp = cfg.get("watch_times") or {}
+        nwt_disp = cfg.get("watch_new_sessions") or {}
+        for d in cfg["watch_dates"]:
+            times = wt_disp.get(d) if isinstance(wt_disp, dict) else None
+            times_str = ", ".join(times) if times else "전체"
+            print(f"    {d}: {times_str}", end="")
+            nr = nwt_disp.get(d)
+            if nr:
+                extra = "전체" if nr.get("mode") == "all" else f"{nr.get('start')}~{nr.get('end')}"
+                print(f"  (+신규회차: {extra})", end="")
+            print()
+        use_saved = input("\n  이 설정 그대로 시작할까요? (Y/n): ").strip().lower()
+        if use_saved in ("", "y", "yes"):
+            print("  저장된 설정으로 시작합니다.")
+            return cfg, token
+
     # ── Step 1: 감시 날짜 ────────────────────────────────────────
     print("\n[ 1 ] 날짜 입력")
     print("  YYYYMMDD 형식, 쉼표로 구분")
@@ -415,45 +439,81 @@ async def interactive_setup(
             break
         print("  YYYYMMDD 형식으로 입력해주세요.")
 
-    ref_date = dates[0]
-
     # ── Step 2: IMAX 영화 목록 조회 ──────────────────────────────
-    print(f"\n  [{ref_date}] 상영 목록 조회 중...", flush=True)
-    sessions_flat, token = await fetch_movie_list(client, token, ref_date, cfg)
-
-    if sessions_flat is None:
-        print("  상영 목록 조회 실패. ACCESS_TOKEN을 확인하세요.")
-        sys.exit(1)
-
-    imax_movies = parse_imax_movies(sessions_flat)
-    if not imax_movies:
-        print(f"  {ref_date}에 IMAX 상영 영화가 없습니다.")
-        sys.exit(1)
+    # 입력한 날짜 중 상영 정보가 있는 첫 날짜를 찾는다 (dates[0]으로 고정하면, 신규
+    # 오픈만 노리는 미래 날짜를 맨 앞에 입력했을 때 아직 상영정보가 없어서 죽어버린다).
+    ref_date = None
+    sessions_flat = None
+    imax_movies: list = []
+    for d in dates:
+        print(f"\n  [{d}] 상영 목록 조회 중...", flush=True)
+        flat, token = await fetch_movie_list(client, token, d, cfg)
+        if flat is None:
+            print(f"  [{d}] 조회 실패")
+            continue
+        movies = parse_imax_movies(flat)
+        if movies:
+            ref_date, sessions_flat, imax_movies = d, flat, movies
+            break
+        print(f"  [{d}] IMAX 상영 영화 없음 (아직 미오픈일 수 있음) — 다음 날짜 확인")
 
     # ── Step 3: 영화 선택 ────────────────────────────────────────
-    print(f"\n[ 2 ] IMAX 영화 목록 ({ref_date})")
-    for i, m in enumerate(imax_movies, 1):
-        cnt = len(m["sessions"])
-        enm = f"  ({m['movEnm']})" if m["movEnm"] else ""
-        print(f"  [{i}] {m['movNm']}{enm}  — {cnt}회차")
+    if imax_movies:
+        print(f"\n[ 2 ] IMAX 영화 목록 ({ref_date})")
+        for i, m in enumerate(imax_movies, 1):
+            cnt = len(m["sessions"])
+            enm = f"  ({m['movEnm']})" if m["movEnm"] else ""
+            print(f"  [{i}] {m['movNm']}{enm}  — {cnt}회차")
 
-    while True:
-        raw = input("\n  영화 번호 선택: ").strip()
-        try:
-            idx = int(raw) - 1
-            if 0 <= idx < len(imax_movies):
-                break
-        except ValueError:
-            pass
-        print("  올바른 번호를 입력하세요.")
+        while True:
+            raw = input("\n  영화 번호 선택: ").strip()
+            try:
+                idx = int(raw) - 1
+                if 0 <= idx < len(imax_movies):
+                    break
+            except ValueError:
+                pass
+            print("  올바른 번호를 입력하세요.")
 
-    selected = imax_movies[idx]
-    cfg["mov_no"]   = selected["movNo"]
-    cfg["mov_name"] = selected["movNm"]
+        selected = imax_movies[idx]
+        cfg["mov_no"]   = selected["movNo"]
+        cfg["mov_name"] = selected["movNm"]
+    else:
+        # 입력한 날짜 전부 아직 상영정보가 없음(전부 신규오픈 전용 미래 날짜인 경우).
+        # 영화 목록에서 고를 수가 없으니, 저장된 영화를 재사용하거나 movNo를 직접 입력받는다.
+        print("\n[ 2 ] 입력한 날짜 전부 아직 상영정보가 없습니다.")
+        if cfg.get("mov_no") and cfg.get("mov_name"):
+            use_prev = input(
+                f"  저장된 영화 '{cfg['mov_name']}'({cfg['mov_no']})를 그대로 쓸까요? (Y/n): "
+            ).strip().lower()
+            if use_prev not in ("", "y", "yes"):
+                mov_no_in = _input("  영화 번호(movNo) 직접 입력", cfg.get("mov_no", ""))
+                cfg["mov_no"] = mov_no_in
+                cfg["mov_name"] = mov_no_in
+        else:
+            mov_no_in = input("  영화 번호(movNo) 직접 입력: ").strip()
+            cfg["mov_no"] = mov_no_in
+            cfg["mov_name"] = mov_no_in
+        selected = {"movNo": cfg["mov_no"], "movNm": cfg["mov_name"]}
 
     # ── Step 4: 날짜별 상영 시간 선택 ──────────────────────────────
     mov_no = cfg["mov_no"]
     watch_times: dict[str, list] = {}
+    watch_new_sessions: dict[str, dict] = {}
+
+    def ask_new_session_rule(date: str, prompt_prefix: str) -> None:
+        raw_new = input(
+            f"  [{date}] {prompt_prefix} "
+            f"(범위: 17:00-22:00 / 전체: all / 안 함: Enter): "
+        ).strip()
+        if raw_new.lower() == "all":
+            watch_new_sessions[date] = {"mode": "all"}
+        elif raw_new:
+            m = re.fullmatch(r"(\d{2}:\d{2})-(\d{2}:\d{2})", raw_new)
+            if m:
+                watch_new_sessions[date] = {"mode": "range", "start": m.group(1), "end": m.group(2)}
+            else:
+                print("  형식이 맞지 않아 무시합니다 (예: 17:00-22:00, all)")
 
     print(f"\n[ 3 ] {selected['movNm']} — 날짜별 상영 시간 선택")
 
@@ -475,8 +535,11 @@ async def interactive_setup(
         )
 
         if not mov_sessions:
-            print(f"\n  [{date}] 해당 영화 IMAX 상영 없음 — 건너뜀")
+            # 아직 이 날짜엔 회차가 하나도 안 열렸을 수 있다 — 취소표 감시 날짜와
+            # 별개로, 신규 오픈만 노리는 미래 날짜일 가능성이 높으므로 여기서도 물어본다.
+            print(f"\n  [{date}] 해당 영화 IMAX 상영 없음 (아직 회차가 안 열렸을 수 있음)")
             watch_times[date] = []
+            ask_new_session_rule(date, "신규 오픈 회차가 뜨면 감시할까요?")
             continue
 
         print(f"\n  [{date}] 상영 시간:")
@@ -500,8 +563,13 @@ async def interactive_setup(
         else:
             watch_times[date] = []
 
+        # 특정 시간만 골랐을 때만 물어봄 (전체 선택이면 이미 신규 회차도 다 감시됨)
+        if watch_times[date]:
+            ask_new_session_rule(date, "위 시간 외에 새로 열리는 회차도 감시할까요?")
+
     cfg["watch_dates"] = dates
     cfg["watch_times"] = watch_times
+    cfg["watch_new_sessions"] = watch_new_sessions
 
     # ── Step 5: 명당 조건 확인 ───────────────────────────────────
     rows_disp = ",".join(sorted(cfg["prime_rows"]))
@@ -524,6 +592,7 @@ async def interactive_setup(
 # ── 스케줄 파싱 (searchSchByMov 응답용) ──────────────────────────────────────
 
 _debug_logged: set = set()
+_seen_sessions: set = set()  # (date, scnsNo, scnSseq) — 이미 한 번이라도 관측된 세션
 
 
 def parse_schedule(data: list, date: str, cfg: dict) -> list:
@@ -540,6 +609,8 @@ def parse_schedule(data: list, date: str, cfg: dict) -> list:
     else:
         watch_times = set(wt)
 
+    new_rule = (cfg.get("watch_new_sessions") or {}).get(date)
+
     now = datetime.now()
     today_str = now.strftime("%Y%m%d")
 
@@ -552,7 +623,27 @@ def parse_schedule(data: list, date: str, cfg: dict) -> list:
         t = s.get("scnsrtTm") or s.get("rlMovStartTm") or "?"
         time_fmt = f"{t[:2]}:{t[2:]}" if len(t) == 4 else t
 
-        if watch_times and time_fmt not in watch_times:
+        # 신규 세션 여부는 시간 필터와 무관하게 전체 IMAX 세션 기준으로 추적한다
+        # (나중에 watch_new_sessions 조건에 걸리는 세션을 정확히 "처음 보는 세션"으로
+        # 판정하려면, 필터에 안 걸려서 건너뛴 세션도 계속 추적해야 하기 때문)
+        sess_key = (date, s.get("scnsNo", ""), str(s.get("scnSseq") or t))
+        is_new = sess_key not in _seen_sessions
+        _seen_sessions.add(sess_key)
+
+        passes_exact = bool(watch_times) and time_fmt in watch_times
+        # watch_new_sessions에 이 날짜 규칙이 명시돼 있으면, "watch_times 비어있음 = 전체 감시"
+        # 기본 동작을 이 날짜에 한해 끄고 그 규칙만 따른다. 안 그러면 "회차가 아직 하나도 없어서
+        # watch_times가 자동으로 비어버린 날짜"에서 range 제한이 항상 무시되고 전부 통과해버린다.
+        passes_all   = (not watch_times) and not new_rule
+        passes_new   = False
+        if is_new and new_rule:
+            mode = new_rule.get("mode")
+            if mode == "all":
+                passes_new = True
+            elif mode == "range":
+                passes_new = new_rule.get("start", "") <= time_fmt <= new_rule.get("end", "")
+
+        if not (passes_exact or passes_all or passes_new):
             continue
 
         # 상영 시작 시간이 이미 지난 세션 제외
@@ -571,6 +662,7 @@ def parse_schedule(data: list, date: str, cfg: dict) -> list:
             "scns_no":    s.get("scnsNo", ""),
             "session_id": s.get("scnSseq") or t,
             "total":      int(s.get("stcnt") or 0),
+            "is_new":     is_new,
         })
     return sessions
 
@@ -621,12 +713,23 @@ async def fetch_prime_seats(
         if not items:
             return None
         seats = items[0].get("seats", [])
-        return {
-            (s["seatRowNm"], s["seatNo"])
-            for s in seats
-            if s.get("seatSaleYn") == "Y"
-            and _is_prime(s.get("seatRowNm", ""), s.get("seatNo", ""), cfg)
-        }
+        # 반환값은 {(row, no): seat_dict} — set처럼 순회/len() 가능하면서, 좌석 상세(seatLocNo 등)를
+        # 자동예매 쪽에 그대로 넘겨서 거기서 또 searchIfSeatData를 다시 조회하는 왕복을 없앤다.
+        # no는 반드시 int로 저장 — find_seat_pairs()가 (row, int, int)로 페어를 만들기 때문에
+        # 여기 키가 문자열이면 나중에 current[(row, a)] 조회가 항상 실패한다.
+        result: dict[tuple[str, int], dict] = {}
+        for s in seats:
+            if s.get("seatSaleYn") != "Y":
+                continue
+            row = s.get("seatRowNm", "")
+            if not _is_prime(row, s.get("seatNo", ""), cfg):
+                continue
+            try:
+                no = int(s.get("seatNo", ""))
+            except (TypeError, ValueError):
+                continue
+            result[(row, no)] = s
+        return result
     except RateLimitError:
         raise
     except Exception as e:
@@ -717,6 +820,31 @@ def _format_pairs(pairs: list[tuple[str, int, int]]) -> str:
     return " / ".join(f"{row}열 {a}-{b}번" for row, a, b in pairs)
 
 
+def rank_seat_pairs(
+    pairs: list[tuple[str, int, int]],
+    row_priority: list[str],
+    center_seats: list[int] | None = None,
+) -> list[tuple[str, int, int]]:
+    """
+    신규 회차 자동예매 전용 우선순위 정렬.
+    1순위: row_priority 목록 순서 (목록에 없는 열은 맨 뒤로)
+    2순위: 같은 열이면 center_seats 중앙값에서 가까운 순
+    3순위: 중앙에서 거리가 같으면(양옆 대칭) 시작 좌석번호가 작은 쪽 먼저
+    """
+    center = sum(center_seats) / len(center_seats) if center_seats else 0.0
+
+    def row_rank(row: str) -> int:
+        try:
+            return row_priority.index(row)
+        except ValueError:
+            return len(row_priority)
+
+    def col_dist(a: int, b: int) -> float:
+        return abs((a + b) / 2 - center)
+
+    return sorted(pairs, key=lambda p: (row_rank(p[0]), col_dist(p[1], p[2]), p[1]))
+
+
 async def process_sessions(
     sessions: list, client: AsyncSession, token: str, cfg: dict
 ) -> None:
@@ -755,8 +883,11 @@ async def process_sessions(
         seat_str = _format_prime_seats(current)
         pairs_str = _format_pairs(pairs)
 
+        is_new_session = bool(s.get("is_new"))
+        headline = "🆕 신규 회차 오픈!" if is_new_session else "🎯 CGV IMAX 2연석 오픈!"
+
         # 토스트용 한 줄 좌석 요약: "G열 19-20번 / H열 25-26번"
-        toast_title = f"🎯 2연석 오픈 — {mov_name}"
+        toast_title = f"{'🆕 신규회차 오픈' if is_new_session else '🎯 2연석 오픈'} — {mov_name}"
         toast_body  = (
             f"📅 {s['date']}  🕐 {s['time']}  |  {s['hall']}\n"
             f"2연석: {pairs_str}\n"
@@ -776,7 +907,7 @@ async def process_sessions(
         )
 
         msg = (
-            f"🎯 <b>CGV IMAX 2연석 오픈!</b>\n\n"
+            f"<b>{headline}</b>\n\n"
             f"🎬 {mov_name}\n"
             f"📅 {s['date']}  🕐 {s['time']}\n"
             f"🏛 {s['hall']}\n\n"
@@ -789,8 +920,38 @@ async def process_sessions(
         )
 
         booked = None
-        if cfg.get("auto_book") and cfg.get("auto_book_armed", True):
-            booked = await try_auto_book(client, token, s, cfg, pairs[0])
+        auto_book_on = cfg.get("auto_book")
+        armed = cfg.get("auto_book_armed", True)
+
+        if is_new_session:
+            # 신규 회차는 명당 안에서도 지정한 열 우선순위 + 중앙 좌석 기준으로 순서를 매겨
+            # 그 순서대로 시도한다 (해당 좌석이 사라지면 find_seat_pair()가 다음 순위로 자동 재탐색).
+            row_priority = cfg.get("new_session_row_priority") or []
+            center_seats = cfg.get("new_session_center_seats") or []
+            ranked = rank_seat_pairs(pairs, row_priority, center_seats) if row_priority else pairs
+            target_pair = ranked[0]
+            print(f"    [좌석 우선순위] {_format_pairs(ranked)}", flush=True)
+        else:
+            row_priority = None
+            center_seats = None
+            target_pair = pairs[0]
+
+        print(
+            f"    [자동예매 게이트] auto_book={auto_book_on} armed={armed} "
+            f"신규세션={is_new_session} 대상좌석={target_pair} "
+            f"→ {'시도함' if (auto_book_on and armed) else '시도 안 함(알림만)'}",
+            flush=True,
+        )
+        if auto_book_on and armed:
+            # 방금 이 라운드에서 이미 받아온 좌석 상세(current)를 그대로 넘겨서, 브라우저 쪽에서
+            # searchIfSeatData를 또 조회하는 왕복을 없앤다 — 감지~좌석선점 사이 인터벌 최소화.
+            row, a, b = target_pair
+            target_seats = [current.get((row, a)), current.get((row, b))]
+            booked = await try_auto_book(
+                client, token, s, cfg, target_pair,
+                row_priority=row_priority, center_seats=center_seats,
+                seats=target_seats if all(target_seats) else None,
+            )
 
         if booked:
             msg = (
@@ -811,6 +972,9 @@ async def process_sessions(
 async def try_auto_book(
     client: AsyncSession, token: str, session: dict, cfg: dict,
     pair: tuple[str, int, int],
+    row_priority: list[str] | None = None,
+    center_seats: list[int] | None = None,
+    seats: list[dict] | None = None,
 ) -> dict | None:
     """
     2연석 감지 시 browser_booking.py(Playwright)로 자동예매 시도.
@@ -818,6 +982,12 @@ async def try_auto_book(
     봇 탐지하는 것으로 보임, 원본 test_seat_hold.py도 동일 증상), 실제 예매 실행은
     Playwright(cgv_session.json 재사용)로 진행한다. 감시 루프 자체는 여전히 curl_cffi라 빠름.
     성공하면 config.json에 armed=False 저장.
+
+    row_priority/center_seats가 주어지면(신규 회차 케이스) pair가 이미 사라졌을 때
+    find_seat_pair()의 대체 탐색이 이 우선순위를 따라 다음 후보로 넘어간다.
+    seats가 주어지면 이번 라운드에 이미 조회해둔 좌석 상세를 그대로 써서
+    browser_booking.py가 searchIfSeatData를 또 조회하는 걸 생략한다(지연 최소화).
+    브라우저는 예열된 걸 재사용하고 매번 새로 띄우지 않는다.
     """
     import browser_booking
 
@@ -825,6 +995,7 @@ async def try_auto_book(
         result = await browser_booking.auto_book(
             token, session["date"], session["scns_no"], str(session["session_id"]),
             cfg.get("mov_no", ""), cfg, pair,
+            row_priority=row_priority, center_seats=center_seats, seats=seats,
         )
     except Exception as e:
         print(f"  [자동예매] 오류: {e}", flush=True)
@@ -944,8 +1115,31 @@ async def main():
     async with AsyncSession(impersonate=_IMPERSONATE) as client:
         cfg, token = await interactive_setup(client, token, cfg)
 
+        # 신규 세션 감지 기준선 기록 — 지금 이미 존재하는 회차들을 "신규"로
+        # 오탐하지 않도록, 감시 루프 시작 전에 한 번 조회해서 _seen_sessions를 채운다.
+        print("\n  [초기화] 기존 회차 기준선 기록 중...", flush=True)
+        for d in cfg["watch_dates"]:
+            try:
+                _, token = await check_date(client, token, d, cfg)
+            except RateLimitError:
+                print(f"  [초기화] [{d}] 429 레이트 리밋 — {RATE_LIMIT_WAIT}초 대기 후 계속", flush=True)
+                await asyncio.sleep(RATE_LIMIT_WAIT)
+            except Exception as e:
+                print(f"  [초기화] [{d}] 조회 실패: {e}", flush=True)
+            await asyncio.sleep(0.3)
+        print("  [초기화] 완료 — 이제부터 새로 뜨는 회차만 신규로 판정합니다.", flush=True)
+
+        if cfg.get("auto_book"):
+            print("  [예열] 자동예매용 브라우저 미리 띄우는 중...", flush=True)
+            try:
+                import browser_booking
+                await browser_booking.get_warm_page()
+            except Exception as e:
+                print(f"  [예열] 실패({e}) — 예매 시도 시점에 새로 띄웁니다.", flush=True)
+
         rows_disp = ", ".join(sorted(cfg["prime_rows"]))
         wt = cfg.get("watch_times") or {}
+        nwt = cfg.get("watch_new_sessions") or {}
 
         print("\n" + "=" * 60)
         print(f"  영화    : {cfg['mov_name']} ({cfg['mov_no']})")
@@ -953,6 +1147,12 @@ async def main():
             times = wt.get(d) if isinstance(wt, dict) else None
             times_disp = ", ".join(times) if times else "전체"
             print(f"  날짜    : {d}  ({times_disp})")
+            new_rule = nwt.get(d)
+            if new_rule:
+                if new_rule.get("mode") == "all":
+                    print(f"    ↳ 신규 회차: 전체 감시")
+                else:
+                    print(f"    ↳ 신규 회차: {new_rule.get('start')}~{new_rule.get('end')} 범위 감시")
         print(f"  명당 조건: {rows_disp}열  {cfg['prime_seat_min']}~{cfg['prime_seat_max']}번")
         ivl = load_interval_state()
         if ivl["locked"]:
@@ -1008,7 +1208,7 @@ async def main():
 
             if rate_limited:
                 if not ivl["locked"]:
-                    ivl["interval"] = min(MAX_CHECK_INTERVAL, ivl["last_known_good"] + SAFETY_MARGIN)
+                    ivl["interval"] = round(min(MAX_CHECK_INTERVAL, ivl["last_known_good"] + SAFETY_MARGIN), 2)
                     ivl["locked"] = True
                     ivl["consecutive_ok"] = 0
                     save_interval_state(ivl)
@@ -1023,7 +1223,7 @@ async def main():
                 ivl["consecutive_ok"] += 1
                 if ivl["consecutive_ok"] >= STABLE_ROUNDS_TO_DECREASE:
                     ivl["last_known_good"] = ivl["interval"]
-                    ivl["interval"] = max(MIN_CHECK_INTERVAL, ivl["interval"] - DECREASE_STEP)
+                    ivl["interval"] = round(max(MIN_CHECK_INTERVAL, ivl["interval"] - DECREASE_STEP), 2)
                     ivl["consecutive_ok"] = 0
                     print(f"  [적응형 인터벌] {STABLE_ROUNDS_TO_DECREASE}라운드 무사고 — {ivl['interval']}초로 축소 시도", flush=True)
                 save_interval_state(ivl)

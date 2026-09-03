@@ -41,6 +41,62 @@ from curl_cffi.requests import AsyncSession
 
 SESSION_FILE = B.Path(__file__).parent / "cgv_session.json"
 
+# ── 예열된 브라우저 (매 시도마다 새로 띄우지 않고 재사용) ────────────────────────
+# REFERER_SEAT_SELECT("/cnm/selectVisitorCnt")는 특정 회차에 묶인 URL이 아니라
+# 좌석선점 POST의 referer로만 쓰이는 공용 페이지라, 한 번 띄워두면 어떤 세션이든
+# (기존 취소표든 신규 오픈이든) 재탐색 없이 그대로 재사용 가능하다.
+_warm_pw = None
+_warm_browser = None
+_warm_context = None
+_warm_page: Page | None = None
+
+
+async def get_warm_page() -> Page:
+    """예열된 페이지가 있으면 그대로 반환, 없으면 한 번만 브라우저를 띄워 좌석선택
+    화면까지 미리 가있는다. 이후 자동예매 시도는 이 페이지를 그대로 재사용해서
+    브라우저 기동(수 초) 지연 없이 바로 좌석선점을 시도할 수 있다."""
+    global _warm_pw, _warm_browser, _warm_context, _warm_page
+
+    if _warm_page is not None:
+        try:
+            if not _warm_page.is_closed():
+                return _warm_page
+        except Exception:
+            pass
+
+    if not SESSION_FILE.exists():
+        raise BookingError(f"{SESSION_FILE.name} 없음 — capture_booking_flow.py를 먼저 실행해 로그인하세요.")
+
+    _warm_pw = await async_playwright().start()
+    _warm_browser = await _warm_pw.chromium.launch(
+        headless=False,
+        args=["--disable-blink-features=AutomationControlled"],
+    )
+    _warm_context = await _warm_browser.new_context(storage_state=str(SESSION_FILE))
+    await _warm_context.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+    )
+    _warm_page = await _warm_context.new_page()
+    await _warm_page.goto(REFERER_SEAT_SELECT, wait_until="domcontentloaded")
+    print("[예열] 자동예매용 브라우저 준비 완료 — 좌석선택 화면 대기중", flush=True)
+    return _warm_page
+
+
+async def close_warm_page() -> None:
+    global _warm_pw, _warm_browser, _warm_context, _warm_page
+    try:
+        if _warm_browser:
+            await _warm_browser.close()
+    except Exception:
+        pass
+    try:
+        if _warm_pw:
+            await _warm_pw.stop()
+    except Exception:
+        pass
+    _warm_pw = _warm_browser = _warm_context = _warm_page = None
+
+
 _FETCH_JS = """
 async ({method, url, body, token}) => {
     const opts = {
@@ -553,23 +609,33 @@ async def pw_click_confirm_payment(page: Page) -> None:
 async def auto_book(
     token: str, date: str, scns_no: str, scn_sseq: str, mov_no: str,
     cfg: dict, target_pair: tuple[str, int, int] | None = None,
+    row_priority: list[str] | None = None,
+    center_seats: list[int] | None = None,
+    seats: list[dict] | None = None,
 ) -> dict | None:
     """
-    2연석 선점 → 관람권 적용 → 최종확정 (좌석찾기는 curl_cffi로 빠르게, 나머지는 Playwright로).
-    성공 시 예매 정보 dict 반환, 실패/DRY_RUN/카드결제 필요 시 None 반환.
+    2연석 선점 → 관람권 적용 → 최종확정. 브라우저는 예열된 걸 재사용(매번 새로 안 띄움),
+    좌석찾기는 curl_cffi로 빠르게(가능하면 그마저도 생략). 성공 시 예매 정보 dict 반환,
+    실패/DRY_RUN/카드결제 필요 시 None 반환.
+
+    row_priority/center_seats가 주어지면(신규 회차 케이스) target_pair가 이미 사라졌을 때
+    find_seat_pair()가 이 우선순위를 따라 다음 후보 2연석을 찾는다.
+    seats가 이미 주어지면(alarm.py가 이번 라운드에 조회해둔 좌석 상세) searchIfSeatData를
+    또 조회하지 않고 바로 그 좌석으로 좌석선점을 시도한다 — 감지~선점 사이 지연을 없앤다.
     """
     async with AsyncSession(impersonate=B._IMPERSONATE) as client:
-        seats = await find_seat_pair(client, date, scns_no, scn_sseq, cfg, target_pair)
-        if not seats:
-            print("[자동예매] 명당 조건에 맞는 2연석을 찾지 못함", flush=True)
-            return None
+        if seats is None:
+            seats = await find_seat_pair(
+                client, date, scns_no, scn_sseq, cfg, target_pair,
+                row_priority=row_priority, center_seats=center_seats,
+            )
+            if not seats:
+                print("[자동예매] 명당 조건에 맞는 2연석을 찾지 못함", flush=True)
+                return None
         sched = await fetch_schedule_detail(client, token, date, scns_no, scn_sseq, cfg)
 
     seat_label = " ".join(f"{s.get('seatRowNm')}{s.get('seatNo')}" for s in seats)
-    print(f"[자동예매] (Playwright) 2연석 선점 시도: {seat_label}", flush=True)
-
-    if not SESSION_FILE.exists():
-        raise BookingError(f"{SESSION_FILE.name} 없음 — capture_booking_flow.py를 먼저 실행해 로그인하세요.")
+    print(f"[자동예매] (예열된 브라우저) 2연석 선점 시도: {seat_label}", flush=True)
 
     import time as _time
     _t0 = _time.monotonic()
@@ -577,98 +643,97 @@ async def auto_book(
     def _mark(label: str) -> None:
         print(f"[타이밍] {label}: +{_time.monotonic() - _t0:.1f}s", flush=True)
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=False,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        context = await browser.new_context(storage_state=str(SESSION_FILE))
-        await context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
-        )
-        page = await context.new_page()
+    page = await get_warm_page()
+    if page.url != REFERER_SEAT_SELECT:
+        await page.goto(REFERER_SEAT_SELECT, wait_until="domcontentloaded")
+
+    mov_atkt_no = ""
+    try:
+        hold_result = await pw_hold_seats(page, date, scns_no, scn_sseq, seats)
+        _mark("좌석선점 완료")
+        data = hold_result.get("data", {})
+        mov_atkt_no = data.get("movAtktNo", "")
+        if not mov_atkt_no:
+            raise BookingError(f"좌석선점 응답에 movAtktNo 없음: {json.dumps(hold_result, ensure_ascii=False)[:300]}")
+        szone_exp_tm = data.get("seatTempPrmpLimitDt", "")
+        print(f"[자동예매] 선점 성공 movAtktNo={mov_atkt_no} 만료={szone_exp_tm}", flush=True)
+
+        if DRY_RUN:
+            print("[자동예매] DRY_RUN 모드 — 관람권 적용/확정 생략 후 즉시 취소", flush=True)
+            await pw_cancel_hold(page, mov_atkt_no, seats)
+            return None
+
+        if len(GIFTC_NOS) != len(seats):
+            raise BookingError(
+                f".env의 GIFTC_NOS에 좌석 수({len(seats)})만큼 관람권 번호가 설정되지 않음 "
+                f"(현재 {len(GIFTC_NOS)}개). 예: GIFTC_NOS=코드1,코드2"
+            )
+
+        prices = await pw_check_prices(page, date, scns_no, scn_sseq, mov_no, seats)
+        amts = [prices[s.get("seatLocNo", "")] for s in seats]
+        _mark("가격조회 완료")
+
+        # 네트워크 로그로 확인한 사실: /mpy/main 페이지는 sessionStorage의 mov/movStore/
+        # query/movieGoers만 보고 자기가 알아서 commonGetPayId + insertIssSalProcTempInfo를
+        # 직접 호출해서 결제세션을 새로 만든다 — 우리가 미리 만든 paymNo/paymVrifyNo(pid)는
+        # 무시되고 버려진다. 그래서 이제 그 두 호출은 하지 않고 페이지에 맡긴다.
+        await pw_set_session_storage(page, sched, seats, amts, mov_atkt_no, szone_exp_tm)
+
+        # networkidle은 GA 등 트래킹 요청이 계속 붙어서 느리다 — domcontentloaded로
+        # 빠르게 넘어가고, 실제 렌더 완료 여부는 아래 금액 폴링으로 확인한다.
+        await page.goto(REFERER_PAYMENT, wait_until="domcontentloaded")
+        _mark("/mpy/main 이동 완료")
+        initial_amt = await pw_wait_payable_amount(page, expect=sum(amts))
+        _mark(f"결제금액 확인 완료 ({initial_amt}원)")
+        if initial_amt != sum(amts):
+            debug_path = B.Path(__file__).parent / "debug_screenshot.png"
+            try:
+                await page.screenshot(path=str(debug_path), full_page=True)
+                print(f"[디버그] 스크린샷 저장: {debug_path}", flush=True)
+            except Exception as e:
+                print(f"[디버그] 스크린샷 저장 실패: {e}", flush=True)
+            raise BookingError(
+                f"결제 화면 금액이 예상과 다름 (화면={initial_amt}원, 예상={sum(amts)}원) — "
+                f"잘못된 세션/화면일 수 있어 중단합니다."
+            )
+
+        # /api/v1/payment/cif/*(관람권 조회·검증)는 fetch() 주입으로는 "인증된 사용자의
+        # 접근이 아닙니다"로 거부돼서(신뢰된 클릭 이벤트가 필요한 것으로 추정), 실제
+        # 체크박스 클릭 → 적용 버튼 클릭으로 우회한다.
+        await pw_apply_vouchers_ui(page, len(seats))
+        _mark("관람권 적용 완료")
+
+        amount_paym_total = await pw_wait_payable_amount(page, expect=0)
+        if amount_paym_total != 0:
+            raise BookingError(
+                f"관람권으로 전액 커버되지 않음 (남은 결제금액={amount_paym_total}원) — "
+                f"실카드 결제가 필요해 자동확정을 중단합니다. 수동으로 완료해주세요."
+            )
+
+        await pw_click_confirm_payment(page)
+        _mark("결제확정 클릭 완료")
+        result = {"final_url": page.url}
+        print(f"[자동예매] 예매확정 클릭 완료. 최종 URL: {page.url}", flush=True)
+        return {
+            "mov_atkt_no": mov_atkt_no,
+            "seat": seat_label,
+            "confirmed_at": B.datetime.now().isoformat(),
+            "result": result,
+        }
+    except Exception:
+        print("[자동예매] 실패 — 좌석선점 롤백 시도", flush=True)
+        if mov_atkt_no:
+            try:
+                await pw_cancel_hold(page, mov_atkt_no, seats)
+            except Exception as e:
+                print(f"[자동예매] 롤백 실패(무시하고 계속): {e}", flush=True)
+        # 다음 시도를 위해 좌석선택 화면으로 되돌려놓는다(결제화면 등으로 넘어가 있었을 수 있음).
+        # 브라우저는 절대 닫지 않는다 — 예열 상태를 유지해야 다음 감지 때 지연이 없다.
         try:
             await page.goto(REFERER_SEAT_SELECT, wait_until="domcontentloaded")
-
-            hold_result = await pw_hold_seats(page, date, scns_no, scn_sseq, seats)
-            _mark("좌석선점 완료")
-            data = hold_result.get("data", {})
-            mov_atkt_no = data.get("movAtktNo", "")
-            if not mov_atkt_no:
-                raise BookingError(f"좌석선점 응답에 movAtktNo 없음: {json.dumps(hold_result, ensure_ascii=False)[:300]}")
-            szone_exp_tm = data.get("seatTempPrmpLimitDt", "")
-            print(f"[자동예매] 선점 성공 movAtktNo={mov_atkt_no} 만료={szone_exp_tm}", flush=True)
-
-            try:
-                if DRY_RUN:
-                    print("[자동예매] DRY_RUN 모드 — 관람권 적용/확정 생략 후 즉시 취소", flush=True)
-                    await pw_cancel_hold(page, mov_atkt_no, seats)
-                    return None
-
-                if len(GIFTC_NOS) != len(seats):
-                    raise BookingError(
-                        f".env의 GIFTC_NOS에 좌석 수({len(seats)})만큼 관람권 번호가 설정되지 않음 "
-                        f"(현재 {len(GIFTC_NOS)}개). 예: GIFTC_NOS=코드1,코드2"
-                    )
-
-                prices = await pw_check_prices(page, date, scns_no, scn_sseq, mov_no, seats)
-                amts = [prices[s.get("seatLocNo", "")] for s in seats]
-                _mark("가격조회 완료")
-
-                # 네트워크 로그로 확인한 사실: /mpy/main 페이지는 sessionStorage의 mov/movStore/
-                # query/movieGoers만 보고 자기가 알아서 commonGetPayId + insertIssSalProcTempInfo를
-                # 직접 호출해서 결제세션을 새로 만든다 — 우리가 미리 만든 paymNo/paymVrifyNo(pid)는
-                # 무시되고 버려진다. 그래서 이제 그 두 호출은 하지 않고 페이지에 맡긴다.
-                await pw_set_session_storage(page, sched, seats, amts, mov_atkt_no, szone_exp_tm)
-
-                # networkidle은 GA 등 트래킹 요청이 계속 붙어서 느리다 — domcontentloaded로
-                # 빠르게 넘어가고, 실제 렌더 완료 여부는 아래 금액 폴링으로 확인한다.
-                # (reload가 아니라 이번이 이 페이지로의 첫 진입이라는 점이 핵심.)
-                await page.goto(REFERER_PAYMENT, wait_until="domcontentloaded")
-                _mark("/mpy/main 첫(유일한) 이동 완료")
-                initial_amt = await pw_wait_payable_amount(page, expect=sum(amts))
-                _mark(f"결제금액 확인 완료 ({initial_amt}원)")
-                if initial_amt != sum(amts):
-                    debug_path = B.Path(__file__).parent / "debug_screenshot.png"
-                    try:
-                        await page.screenshot(path=str(debug_path), full_page=True)
-                        print(f"[디버그] 스크린샷 저장: {debug_path}", flush=True)
-                    except Exception as e:
-                        print(f"[디버그] 스크린샷 저장 실패: {e}", flush=True)
-                    raise BookingError(
-                        f"결제 화면 금액이 예상과 다름 (화면={initial_amt}원, 예상={sum(amts)}원) — "
-                        f"잘못된 세션/화면일 수 있어 중단합니다."
-                    )
-
-                # /api/v1/payment/cif/*(관람권 조회·검증)는 fetch() 주입으로는 "인증된 사용자의
-                # 접근이 아닙니다"로 거부돼서(신뢰된 클릭 이벤트가 필요한 것으로 추정), 실제
-                # 체크박스 클릭 → 적용 버튼 클릭으로 우회한다.
-                await pw_apply_vouchers_ui(page, len(seats))
-                _mark("관람권 적용 완료")
-
-                amount_paym_total = await pw_wait_payable_amount(page, expect=0)
-                if amount_paym_total != 0:
-                    raise BookingError(
-                        f"관람권으로 전액 커버되지 않음 (남은 결제금액={amount_paym_total}원) — "
-                        f"실카드 결제가 필요해 자동확정을 중단합니다. 수동으로 완료해주세요."
-                    )
-
-                await pw_click_confirm_payment(page)
-                _mark("결제확정 클릭 완료")
-                result = {"final_url": page.url}
-                print(f"[자동예매] 예매확정 클릭 완료. 최종 URL: {page.url}", flush=True)
-                return {
-                    "mov_atkt_no": mov_atkt_no,
-                    "seat": seat_label,
-                    "confirmed_at": B.datetime.now().isoformat(),
-                    "result": result,
-                }
-            except Exception:
-                print("[자동예매] 실패 — 좌석선점 롤백 시도", flush=True)
-                await pw_cancel_hold(page, mov_atkt_no, seats)
-                raise
-        finally:
-            await browser.close()
+        except Exception:
+            pass
+        raise
 
 
 async def main() -> None:
@@ -689,6 +754,9 @@ async def main() -> None:
     except Exception as e:
         print(f"[자동예매] 오류: {e}", flush=True)
         return
+    finally:
+        # CLI 단독 실행일 때는 예열 브라우저를 계속 띄워둘 이유가 없으니 정리한다.
+        await close_warm_page()
 
     if result:
         print(f"\n[결과] 예매 완료: {result}")
